@@ -1,0 +1,1229 @@
+//@version=5
+strategy("XAUUSD Auto Trader V4.2",
+     overlay=true,
+     calc_on_every_tick=true,           // needed for intrabar SL trailing updates
+     process_orders_on_close=true,      // bar-close entries/exits
+     initial_capital=1000,
+     commission_type=strategy.commission.percent,
+     commission_value=0.0)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PineConnector (MT5 Automation) — FIXED 0.01 LOT
+// ─────────────────────────────────────────────────────────────────────────────
+groupPC  = "PineConnector (MT5 Automation)"
+pcID     = input.string("YOUR_LICENSE_ID", "PineConnector License ID", group=groupPC)
+pcSymbol = input.string("XAUUSD", "MT5 Symbol (must match broker, e.g. XAUUSD / XAUUSDm)", group=groupPC)
+
+// Fixed lots (your request)
+pcRiskLots = input.float(0.01, "risk= LOTS (fixed)", group=groupPC, step=0.01)
+
+// Alert hygiene
+sendPCAlerts   = input.bool(true, "Send PineConnector webhooks", group=groupPC)
+oneAlertPerBar = input.bool(true, "One alert per bar (anti-spam)", group=groupPC)
+pcUseLegacyModify = input.bool(true, "Use legacy sl= for SL modify (compat)", group=groupPC)
+pcMinModifyGap = input.float(0.5, "Min gap for SL modify ($)", group=groupPC, step=0.1, minval=0.0)
+pcIntrabarSLUpdates = input.bool(true, "Intrabar SL modify alerts (realtime)", group=groupPC)
+pcMinSecondsBetweenSLMods = input.int(5, "Min seconds between SL modify alerts", group=groupPC, minval=0)
+pcRequireEntryAlertBeforeSLMods = input.bool(true, "Require entry alert before SL modifies", group=groupPC)
+pcMaxSLModsPerMinute = input.int(12, "Max SL modify alerts per minute (0=off)", group=groupPC, minval=0)
+pcDuplicateSuppressMs = input.int(1500, "Suppress duplicate webhook payloads within ms", group=groupPC, minval=0)
+pcModStartR = input.float(2.0, "Start SL modify at R multiple", group=groupPC, step=0.25, minval=0.5)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Execution
+// ─────────────────────────────────────────────────────────────────────────────
+groupExec   = "Execution"
+tfSignal    = input.timeframe("", "Signal TF (empty = chart TF, set '5' to lock to 5m)", group=groupExec)
+execGateTF  = input.timeframe("1", "Execution gate TF (close)", group=groupExec)
+useLong     = input.bool(true,  "Enable Longs", group=groupExec)
+useShort    = input.bool(true,  "Enable Shorts", group=groupExec)
+testMode    = input.bool(false, "TEST MODE: force alerts", group=groupExec)
+testEveryNBars = input.int(3, "TEST MODE: fire every N bars", group=groupExec, minval=1)
+testDirection  = input.string("Long", "TEST MODE direction", options=["Long", "Short"], group=groupExec)
+resetStrategyState = input.bool(false, "RESET: close strategy position/state (toggle ON)", group=groupExec)
+
+// Hard close gating (chart close or selected execution TF close)
+onlyOnClose = input.bool(true, "Only signal on bar close (recommended)", group=groupExec)
+execCloseTime = request.security(syminfo.tickerid, execGateTF, time_close, barmerge.gaps_off, barmerge.lookahead_off)
+isNewExecClose = not na(execCloseTime[1]) and execCloseTime != execCloseTime[1]
+// Prevent intrabar "ghost" setup/entry states when calc_on_every_tick is enabled.
+// We only allow entry logic on confirmed chart-bar close.
+barOk = onlyOnClose ? (isNewExecClose and barstate.isconfirmed) : true
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Trend filters (EMA/RSI/MACD)
+// ─────────────────────────────────────────────────────────────────────────────
+groupTrend  = "Trend Filters (EMA/RSI/MACD)"
+emaFastLen  = input.int(21,  "EMA Fast", group=groupTrend, minval=1)
+emaMidLen   = input.int(50,  "EMA Mid",  group=groupTrend, minval=1)
+emaSlowLen  = input.int(200, "EMA Slow", group=groupTrend, minval=1)
+rsiLen      = input.int(14,  "RSI Length", group=groupTrend, minval=1)
+macdFast    = input.int(12,  "MACD Fast", group=groupTrend, minval=1)
+macdSlow    = input.int(26,  "MACD Slow", group=groupTrend, minval=1)
+macdSig     = input.int(9,   "MACD Signal", group=groupTrend, minval=1)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Regime (ADX) — NO DEAD ZONE (state machine with hysteresis)
+// ─────────────────────────────────────────────────────────────────────────────
+groupRegime = "Regime (ADX — No Dead Zone)"
+adxLen      = input.int(14,   "ADX Length", group=groupRegime, minval=1)
+adxTrendMin = input.float(20, "Flip to TREND if ADX >", group=groupRegime, step=0.5)
+adxRangeMax = input.float(18, "Flip to RANGE if ADX <", group=groupRegime, step=0.5)
+
+// Trade quality filters (aim: fewer but cleaner entries)
+groupQuality = "Trade Quality Filters"
+entryProfile      = input.string("Balanced", "Entry profile", options=["Conservative", "Balanced", "Aggressive"], group=groupQuality)
+optimizationObjective = input.string("Balanced", "Optimization objective", options=["Balanced", "Win Rate", "Profit Factor"], group=groupQuality)
+useQualityFilters = input.bool(true, "Enable quality filters", group=groupQuality)
+requireAdxRising  = input.bool(true, "Require ADX rising for entries", group=groupQuality)
+minRoomATR        = input.float(0.8, "Min room to opposite S/R (ATR)", group=groupQuality, step=0.1, minval=0.0)
+useHTFBias        = input.bool(true, "Use HTF EMA bias filter", group=groupQuality)
+htfBiasTF         = input.timeframe("60", "HTF bias timeframe", group=groupQuality)
+htfBiasEmaLen     = input.int(200, "HTF EMA length", group=groupQuality, minval=1)
+rangeRsiLongMin   = input.float(55, "Range long: RSI must be >=", group=groupQuality, step=1)
+rangeRsiShortMax  = input.float(45, "Range short: RSI must be <=", group=groupQuality, step=1)
+requireMomentumAll = input.bool(true, "Require RSI+MACD alignment for all entries", group=groupQuality)
+requireEmaContext  = input.bool(true, "Require price on correct side of EMA50", group=groupQuality)
+useMinConfluence   = input.bool(true, "Use minimum confluence mode", group=groupQuality)
+minConfluences     = input.int(3, "Minimum confluences required", group=groupQuality, minval=1, maxval=8)
+alwaysRequireRsiMacdBase = input.bool(true, "Always require RSI+MACD as base", group=groupQuality)
+minExtraConfluences = input.int(1, "Min extra confluences beyond RSI+MACD", group=groupQuality, minval=0, maxval=8)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S/R (Improved) — HTF pivots + break/retest + sweep/reclaim
+// ─────────────────────────────────────────────────────────────────────────────
+groupSR     = "S/R + Structure"
+pivotTF       = input.timeframe("15", "Pivot TF (levels)", group=groupSR)
+pivotLeft     = input.int(3, "Pivot Left", group=groupSR, minval=1)
+pivotRight    = input.int(3, "Pivot Right", group=groupSR, minval=1)
+retestTolATR  = input.float(0.25, "Retest tolerance (ATR multiple)", group=groupSR, step=0.05)
+retestMaxBars = input.int(24, "Retest must occur within bars", group=groupSR, minval=1)
+
+// Structure (swings + BOS + sweeps)
+swingLeft   = input.int(3, "Swing Left (structure)", group=groupSR, minval=1)
+swingRight  = input.int(3, "Swing Right (structure)", group=groupSR, minval=1)
+breakTolATR = input.float(0.10, "Break tolerance (ATR multiple)", group=groupSR, step=0.05)
+
+// FVG
+useFVG      = input.bool(true, "Use FVG mitigation filter", group=groupSR)
+useTrendTemplate     = input.bool(true, "Use Intraday", group=groupSR)
+useRangeTemplate     = input.bool(false, "Enable Scalp (Range template)", group=groupSR)
+useStructureTemplate = input.bool(true, "Use Structure", group=groupSR)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HARD RISK CAP (fixed lot, cap loss at $10)
+// ─────────────────────────────────────────────────────────────────────────────
+groupHardRisk = "HARD RISK CAP (Fixed Lots)"
+maxRiskUsd          = input.float(10.0, "Max risk per trade ($)", group=groupHardRisk, step=0.5)
+maxRiskUsdScalp     = input.float(2.0, "Max risk per scalp trade ($)", group=groupHardRisk, step=0.5)
+
+// Calibrate once for your broker:
+// Example: if 0.01 lot makes ~$1 P/L for a $1 move in XAUUSD, keep = 1.0
+usdPer1Move_001lot  = input.float(1.0, "USD per $1 move at 0.01 lot (calibrate)", group=groupHardRisk, step=0.1, minval=0.0001)
+
+// SL/TP shaping
+groupRisk   = "Stops/Targets (Price-based)"
+maxSL_ATR   = input.float(1.0, "ATR stop multiplier (pre-cap)", group=groupRisk, step=0.1)
+minSL_ATR   = input.float(0.20, "Min stop (ATR multiple)", group=groupRisk, step=0.05)
+tpR         = input.float(2.0, "Take Profit at R multiple", group=groupRisk, step=0.25)
+maxStopDist = input.float(7.0, "Max stop distance ($, 0=off)", group=groupRisk, step=0.25, minval=0.0)
+useTrailingSL = input.bool(true, "Use trailing SL instead of fixed TP", group=groupRisk)
+beAtR         = input.float(1.0, "Move SL to BE at R", group=groupRisk, step=0.25, minval=0.1)
+beAtMove      = input.float(2.0, "Move SL to BE at $ move", group=groupRisk, step=0.25, minval=0.1)
+trailATRMult  = input.float(1.0, "ATR trail multiplier (after BE)", group=groupRisk, step=0.1, minval=0.1)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Limits
+// ─────────────────────────────────────────────────────────────────────────────
+groupLimits  = "Limits"
+maxTradesDay = input.int(4,  "Max trades per day (0 = no limit)", group=groupLimits, minval=0)
+dailyLossMax = input.float(30, "Daily loss stop ($, 0 = no limit)", group=groupLimits, step=1, minval=0)
+cooldownBars = input.int(5,  "Cooldown bars after exit", group=groupLimits, minval=0)
+
+// Session / time filter
+groupSession = "Session / Time Filter"
+useSessionFilter = input.bool(true, "Enable session filter", group=groupSession)
+tradeSession     = input.session("0700-1700", "Allowed session (exchange time)", group=groupSession)
+useWeekdayFilter = input.bool(true, "Enable weekday filter", group=groupSession)
+allowMon = input.bool(true, "Monday", group=groupSession)
+allowTue = input.bool(true, "Tuesday", group=groupSession)
+allowWed = input.bool(true, "Wednesday", group=groupSession)
+allowThu = input.bool(true, "Thursday", group=groupSession)
+allowFri = input.bool(true, "Friday", group=groupSession)
+allowSat = input.bool(false, "Saturday", group=groupSession)
+allowSun = input.bool(false, "Sunday", group=groupSession)
+
+// Reporting
+groupReport = "Reporting"
+showSetupReport = input.bool(true, "Show setup performance table", group=groupReport)
+showLongBlockDebug = input.bool(true, "Show long blocker debug table", group=groupReport)
+showShortBlockDebug = input.bool(true, "Show short blocker debug table", group=groupReport)
+showEntryAlertDebug = input.bool(true, "Show entry alert send markers", group=groupReport)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+f_tf(x) =>
+    tfSignal == "" ? x : request.security(syminfo.tickerid, tfSignal, x)
+
+// MACD without tuple
+f_macd_line(_src, _fast, _slow) =>
+    ta.ema(_src, _fast) - ta.ema(_src, _slow)
+
+f_macd_signal(_src, _fast, _slow, _sig) =>
+    ta.ema(f_macd_line(_src, _fast, _slow), _sig)
+
+// ADX computed manually (stable)
+f_adx(_len) =>
+    upMove   = high - high[1]
+    downMove = low[1] - low
+    plusDM   = (upMove > downMove and upMove > 0) ? upMove : 0.0
+    minusDM  = (downMove > upMove and downMove > 0) ? downMove : 0.0
+
+    tr   = ta.tr(true)
+    atr_ = ta.rma(tr, _len)
+
+    plusDM_rma  = ta.rma(plusDM, _len)
+    minusDM_rma = ta.rma(minusDM, _len)
+
+    plusDI  = atr_ != 0.0 ? (100.0 * plusDM_rma / atr_) : 0.0
+    minusDI = atr_ != 0.0 ? (100.0 * minusDM_rma / atr_) : 0.0
+
+    sumDI = plusDI + minusDI
+    dx    = sumDI != 0.0 ? (100.0 * math.abs(plusDI - minusDI) / sumDI) : 0.0
+    ta.rma(dx, _len)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Indicators (optionally from higher TF)
+// ─────────────────────────────────────────────────────────────────────────────
+atr    = f_tf(ta.atr(14))
+ema21  = f_tf(ta.ema(close, emaFastLen))
+ema50  = f_tf(ta.ema(close, emaMidLen))
+ema200 = f_tf(ta.ema(close, emaSlowLen))
+rsi    = f_tf(ta.rsi(close, rsiLen))
+
+macdLine = f_tf(f_macd_line(close, macdFast, macdSlow))
+sigLine  = f_tf(f_macd_signal(close, macdFast, macdSlow, macdSig))
+hist     = macdLine - sigLine
+
+adx = f_tf(f_adx(adxLen))
+
+// Trend structure
+bullStack = ema21 > ema50 and ema50 > ema200
+bearStack = ema21 < ema50 and ema50 < ema200
+
+priceBull = close > ema21 and close > ema50
+priceBear = close < ema21 and close < ema50
+
+// MACD phase: turn on slope flip, then maintain direction until opposite turn.
+histDelta = hist - hist[1]
+macdTurnUp = histDelta > 0 and histDelta[1] <= 0
+macdTurnDown = histDelta < 0 and histDelta[1] >= 0
+var int macdPhase = 0  // 1=rising phase, -1=falling phase
+if barstate.isfirst
+    macdPhase := histDelta >= 0 ? 1 : -1
+if macdTurnUp
+    macdPhase := 1
+else if macdTurnDown
+    macdPhase := -1
+macdUp   = macdPhase == 1
+macdDown = macdPhase == -1
+// Accept either phase direction OR signal-line bias to avoid false MACD blocks.
+macdLongOk = macdUp or macdLine > sigLine
+macdShortOk = macdDown or macdLine < sigLine
+
+rsiBull = rsi > 50
+rsiBear = rsi < 50
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Regime state machine (NO dead zone)
+// ─────────────────────────────────────────────────────────────────────────────
+var int regime = 1  // 1=TREND, -1=RANGE
+if barstate.isfirst
+    regime := 1
+
+if adx > adxTrendMin
+    regime := 1
+else if adx < adxRangeMax
+    regime := -1
+// else keep previous
+
+trendMode = regime == 1
+rangeMode = regime == -1
+
+// Quality filters
+adxRising = adx > adx[1]
+isConservative = entryProfile == "Conservative"
+isAggressive   = entryProfile == "Aggressive"
+isObjWin       = optimizationObjective == "Win Rate"
+isObjPF        = optimizationObjective == "Profit Factor"
+
+reqAdxRisingEff = requireAdxRising and not isAggressive
+useHTFBiasEff   = useHTFBias and not isAggressive
+reqMomEff       = requireMomentumAll and not isAggressive
+reqCtxEff       = requireEmaContext and isConservative
+roomATRMultEff  = isConservative ? minRoomATR : isAggressive ? (minRoomATR * 0.40) : (minRoomATR * 0.70)
+roomObjFactor   = isObjWin ? 1.15 : isObjPF ? 0.85 : 1.0
+roomFinalMult   = roomATRMultEff * roomObjFactor
+
+adxEntryOk = not useQualityFilters or (not reqAdxRisingEff or adxRising)
+
+htfClose = request.security(syminfo.tickerid, htfBiasTF, close)
+htfEma   = request.security(syminfo.tickerid, htfBiasTF, ta.ema(close, htfBiasEmaLen))
+htfBull  = htfClose > htfEma
+htfBear  = htfClose < htfEma
+biasLongOk  = not useQualityFilters or not useHTFBiasEff or htfBull
+biasShortOk = not useQualityFilters or not useHTFBiasEff or htfBear
+momLongOk   = not useQualityFilters or not reqMomEff or (rsi > 50 and macdLine > sigLine)
+momShortOk  = not useQualityFilters or not reqMomEff or (rsi < 50 and macdLine < sigLine)
+ctxLongOk   = not useQualityFilters or not reqCtxEff or close > ema50
+ctxShortOk  = not useQualityFilters or not reqCtxEff or close < ema50
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Improved S/R levels from HTF pivots
+// ─────────────────────────────────────────────────────────────────────────────
+pH_htf = request.security(syminfo.tickerid, pivotTF, ta.pivothigh(high, pivotLeft, pivotRight))
+pL_htf = request.security(syminfo.tickerid, pivotTF, ta.pivotlow(low,  pivotLeft, pivotRight))
+
+var float lastRes = na
+var int   lastResBar = na
+if not na(pH_htf)
+    lastRes := pH_htf
+    lastResBar := bar_index
+
+var float lastSup = na
+var int   lastSupBar = na
+if not na(pL_htf)
+    lastSup := pL_htf
+    lastSupBar := bar_index
+
+tol       = atr * retestTolATR
+breakTol  = atr * breakTolATR
+
+resFresh = not na(lastRes) and (bar_index - lastResBar) <= retestMaxBars
+supFresh = not na(lastSup) and (bar_index - lastSupBar) <= retestMaxBars
+
+// Break & retest
+brokeAboveRes = resFresh and close > lastRes + breakTol
+brokeBelowSup = supFresh and close < lastSup - breakTol
+
+retestResAfterBreak = brokeAboveRes[1] and low <= lastRes + tol and close > lastRes
+retestSupAfterBreak = brokeBelowSup[1] and high >= lastSup - tol and close < lastSup
+
+bullConfirm = close > open and close > close[1]
+bearConfirm = close < open and close < close[1]
+
+// Touch+reject (pivot rejection)
+touchResReject = resFresh and high >= (lastRes - tol) and close < lastRes and bearConfirm
+touchSupReject = supFresh and low  <= (lastSup + tol) and close > lastSup and bullConfirm
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Structure logic (swings, BOS, sweeps)
+// ─────────────────────────────────────────────────────────────────────────────
+sHigh = ta.pivothigh(high, swingLeft, swingRight)
+sLow  = ta.pivotlow(low,  swingLeft, swingRight)
+
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+if not na(sHigh)
+    lastSwingHigh := sHigh
+if not na(sLow)
+    lastSwingLow := sLow
+
+sweepHigh = not na(lastSwingHigh) and high > lastSwingHigh + tol and close < lastSwingHigh
+sweepLow  = not na(lastSwingLow)  and low  < lastSwingLow  - tol and close > lastSwingLow
+
+bullBOS = not na(lastSwingHigh) and close > lastSwingHigh + breakTol
+bearBOS = not na(lastSwingLow)  and close < lastSwingLow  - breakTol
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FVG (3-candle imbalance) + mitigation
+// ─────────────────────────────────────────────────────────────────────────────
+bullFVG = high[2] < low
+bearFVG = low[2] > high
+
+// For previous-bar FVG, use its original anchors: high[3]/low[1] and low[3]/high[1].
+mitigateBullFVG = bullFVG[1] and low <= high[3] and close > open
+mitigateBearFVG = bearFVG[1] and high >= low[3] and close < open
+
+fvgLongOk  = not useFVG or mitigateBullFVG or not bullFVG[1]
+fvgShortOk = not useFVG or mitigateBearFVG or not bearFVG[1]
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Signal families
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Template A: Trend-follow (intraday)
+longTrend  = trendMode and adx >= adxTrendMin and bullStack and priceBull and rsiBull and macdLongOk and (touchSupReject or retestResAfterBreak) and fvgLongOk
+shortTrend = trendMode and adx >= adxTrendMin and bearStack and priceBear and rsiBear and macdShortOk and (touchResReject or retestSupAfterBreak) and fvgShortOk
+
+// Template B: Range/scalp
+longRange  = rangeMode and touchSupReject and bullConfirm and rsi >= rangeRsiLongMin and fvgLongOk
+shortRange = rangeMode and touchResReject and bearConfirm and rsi <= rangeRsiShortMax and fvgShortOk
+
+// Template C: Structure
+longStructure  = (sweepLow and bullConfirm and fvgLongOk) or (bullBOS and (retestResAfterBreak or bullConfirm))
+shortStructure = (sweepHigh and bearConfirm and fvgShortOk) or (bearBOS and (retestSupAfterBreak or bearConfirm))
+
+// Combine
+useRangeEff = useRangeTemplate or isAggressive
+longSignalRawLegacy  = (useTrendTemplate and longTrend) or (useRangeEff and longRange) or (useStructureTemplate and longStructure)
+shortSignalRawLegacy = (useTrendTemplate and shortTrend) or (useRangeEff and shortRange) or (useStructureTemplate and shortStructure)
+
+// Universal confluence counting across setups (when enabled).
+longConfTrend  = trendMode and bullStack and priceBull and rsiBull and macdLongOk
+shortConfTrend = trendMode and bearStack and priceBear and rsiBear and macdShortOk
+longConfRange  = touchSupReject and bullConfirm and rsi >= rangeRsiLongMin
+shortConfRange = touchResReject and bearConfirm and rsi <= rangeRsiShortMax
+longConfStruct = sweepLow or bullBOS
+shortConfStruct = sweepHigh or bearBOS
+
+// Core confluences
+longConfRegime = trendMode
+shortConfRegime = trendMode
+longConfStack = bullStack
+shortConfStack = bearStack
+longConfPrice = priceBull
+shortConfPrice = priceBear
+longConfRsi = rsiBull
+shortConfRsi = rsiBear
+longConfMacd = macdLongOk
+shortConfMacd = macdShortOk
+longConfSR = touchSupReject or retestResAfterBreak
+shortConfSR = touchResReject or retestSupAfterBreak
+longConfStructure = sweepLow or bullBOS
+shortConfStructure = sweepHigh or bearBOS
+longConfFvg = fvgLongOk
+shortConfFvg = fvgShortOk
+
+// Requested: include these in confluence scoring (not hard blockers)
+longConfAdx = adxEntryOk
+shortConfAdx = adxEntryOk
+longConfBias = biasLongOk
+shortConfBias = biasShortOk
+longConfCtx = ctxLongOk
+shortConfCtx = ctxShortOk
+
+longConfluenceCount = (longConfRegime ? 1 : 0) + (longConfStack ? 1 : 0) + (longConfPrice ? 1 : 0) + (longConfRsi ? 1 : 0) +
+     (longConfMacd ? 1 : 0) + (longConfSR ? 1 : 0) + (longConfStructure ? 1 : 0) + (longConfFvg ? 1 : 0) +
+     (longConfAdx ? 1 : 0) + (longConfBias ? 1 : 0) + (longConfCtx ? 1 : 0)
+shortConfluenceCount = (shortConfRegime ? 1 : 0) + (shortConfStack ? 1 : 0) + (shortConfPrice ? 1 : 0) + (shortConfRsi ? 1 : 0) +
+     (shortConfMacd ? 1 : 0) + (shortConfSR ? 1 : 0) + (shortConfStructure ? 1 : 0) + (shortConfFvg ? 1 : 0) +
+     (shortConfAdx ? 1 : 0) + (shortConfBias ? 1 : 0) + (shortConfCtx ? 1 : 0)
+
+longBaseMomentumOk  = longConfRsi and longConfMacd
+shortBaseMomentumOk = shortConfRsi and shortConfMacd
+longExtraConfluenceCount  = longConfluenceCount - (longConfRsi ? 1 : 0) - (longConfMacd ? 1 : 0)
+shortExtraConfluenceCount = shortConfluenceCount - (shortConfRsi ? 1 : 0) - (shortConfMacd ? 1 : 0)
+longBasePlusExtraOk  = not alwaysRequireRsiMacdBase or (longBaseMomentumOk and longExtraConfluenceCount >= minExtraConfluences)
+shortBasePlusExtraOk = not alwaysRequireRsiMacdBase or (shortBaseMomentumOk and shortExtraConfluenceCount >= minExtraConfluences)
+
+longTemplateEvidence = (useTrendTemplate and longConfTrend) or (useRangeEff and longConfRange) or (useStructureTemplate and longConfStruct)
+shortTemplateEvidence = (useTrendTemplate and shortConfTrend) or (useRangeEff and shortConfRange) or (useStructureTemplate and shortConfStruct)
+
+longSignalRaw  = useMinConfluence ? (longTemplateEvidence and longConfluenceCount >= minConfluences and longBasePlusExtraOk) : longSignalRawLegacy
+shortSignalRaw = useMinConfluence ? (shortTemplateEvidence and shortConfluenceCount >= minConfluences and shortBasePlusExtraOk) : shortSignalRawLegacy
+
+roomLongOk  = not useQualityFilters or na(lastRes) or (lastRes - close) >= (roomFinalMult * atr)
+roomShortOk = not useQualityFilters or na(lastSup) or (close - lastSup) >= (roomFinalMult * atr)
+
+longSignal  = barOk and useLong  and longSignalRaw  and roomLongOk and momLongOk
+shortSignal = barOk and useShort and shortSignalRaw and roomShortOk and momShortOk
+
+// Setup label text (debug)
+f_setup_long() =>
+    string result = "LONG:?"
+    if useMinConfluence
+        result := str.format("LONG:CONF {0}/{1}", str.tostring(longConfluenceCount), str.tostring(minConfluences))
+    else if longStructure
+        result := "LONG:STRUCT"
+    else if longTrend
+        result := "LONG:TREND"
+    else if longRange
+        result := "LONG:RANGE"
+    result
+
+f_setup_short() =>
+    string result = "SHORT:?"
+    if useMinConfluence
+        result := str.format("SHORT:CONF {0}/{1}", str.tostring(shortConfluenceCount), str.tostring(minConfluences))
+    else if shortStructure
+        result := "SHORT:STRUCT"
+    else if shortTrend
+        result := "SHORT:TREND"
+    else if shortRange
+        result := "SHORT:RANGE"
+    result
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Limits (daily stop, max trades/day, cooldown)
+// ─────────────────────────────────────────────────────────────────────────────
+var float dayStartEquity = na
+var int   tradesToday = 0
+var int   lastExitBar = na
+
+newDay = ta.change(time("D")) != 0
+if barstate.isfirst
+    dayStartEquity := strategy.equity
+    tradesToday := 0
+
+if newDay
+    dayStartEquity := strategy.equity
+    tradesToday := 0
+
+dailyPnL  = na(dayStartEquity) ? 0.0 : (strategy.equity - dayStartEquity)
+dailyStop = dailyLossMax > 0 and dailyPnL <= -dailyLossMax
+
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    lastExitBar := bar_index
+
+cooldownOk    = na(lastExitBar) ? true : (bar_index - lastExitBar) >= cooldownBars
+tradeBudgetOk = maxTradesDay <= 0 or tradesToday < maxTradesDay
+inSession = not useSessionFilter or not na(time(timeframe.period, tradeSession))
+dow = dayofweek
+weekdayOk = not useWeekdayFilter or (
+     (dow == dayofweek.monday    and allowMon) or
+     (dow == dayofweek.tuesday   and allowTue) or
+     (dow == dayofweek.wednesday and allowWed) or
+     (dow == dayofweek.thursday  and allowThu) or
+     (dow == dayofweek.friday    and allowFri) or
+     (dow == dayofweek.saturday  and allowSat) or
+     (dow == dayofweek.sunday    and allowSun))
+timeOk = inSession and weekdayOk
+canTrade = not dailyStop and cooldownOk and tradeBudgetOk and timeOk
+
+// Persist entry-time setup class so risk cap does not drift while in a trade.
+var bool longPosIsScalp = false
+var bool shortPosIsScalp = false
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HARD RISK CAP → stop distance (price dollars)
+// Uses pcRiskLots (so cap matches the actual lot sent to MT5)
+// ─────────────────────────────────────────────────────────────────────────────
+usdPer1Move = math.max(usdPer1Move_001lot * (pcRiskLots / 0.01), 0.0001)
+// Strict scalp classification: RANGE only.
+longIsScalpSetup = longRange
+shortIsScalpSetup = shortRange
+
+// Freeze risk class at entry while position is open.
+longScalpCapActive = strategy.position_size > 0 ? longPosIsScalp : longIsScalpSetup
+shortScalpCapActive = strategy.position_size < 0 ? shortPosIsScalp : shortIsScalpSetup
+
+maxRiskUsdLong = longScalpCapActive ? maxRiskUsdScalp : maxRiskUsd
+maxRiskUsdShort = shortScalpCapActive ? maxRiskUsdScalp : maxRiskUsd
+maxStopByRiskLong = maxRiskUsdLong / usdPer1Move
+maxStopByRiskShort = maxRiskUsdShort / usdPer1Move
+
+stopDistATR = atr * maxSL_ATR
+stopDistMin = atr * minSL_ATR
+
+stopDistLong = math.min(stopDistATR, maxStopByRiskLong)
+stopDistLong := math.max(stopDistLong, stopDistMin)
+stopDistShort = math.min(stopDistATR, maxStopByRiskShort)
+stopDistShort := math.max(stopDistShort, stopDistMin)
+volatilityOkLong = maxStopDist <= 0.0 or stopDistLong <= maxStopDist
+volatilityOkShort = maxStopDist <= 0.0 or stopDistShort <= maxStopDist
+volatilityOk = volatilityOkLong and volatilityOkShort
+
+// SL/TP (absolute prices, market entry assumed near close)
+longSL  = close - stopDistLong
+longTP  = close + (tpR * stopDistLong)
+shortSL = close + stopDistShort
+shortTP = close - (tpR * stopDistShort)
+
+// Stateful trailing engine (strategy-side) - stepped R trailing
+// Rules:
+// 1) At +1.0R, move SL to break-even.
+// 2) Then update only each +0.5R step:
+//    +1.5R -> SL locks +1.25R, +2.0R -> SL locks +1.75R, etc.
+var float longEntryPx = na
+var float shortEntryPx = na
+var float longRiskDist = na
+var float shortRiskDist = na
+var float longHighSinceEntry = na
+var float shortLowSinceEntry = na
+var float dynLongStop = na
+var float dynShortStop = na
+var float posSizePrevTick = 0.0
+
+newLongPos = strategy.position_size > 0 and posSizePrevTick <= 0
+newShortPos = strategy.position_size < 0 and posSizePrevTick >= 0
+justFlat = strategy.position_size == 0 and posSizePrevTick != 0
+
+if newLongPos
+    longEntryPx := strategy.position_avg_price
+    longRiskDist := stopDistLong
+    longHighSinceEntry := high
+    dynLongStop := longEntryPx - longRiskDist
+
+if newShortPos
+    shortEntryPx := strategy.position_avg_price
+    shortRiskDist := stopDistShort
+    shortLowSinceEntry := low
+    dynShortStop := shortEntryPx + shortRiskDist
+
+if strategy.position_size > 0
+    if na(longEntryPx) or na(longRiskDist)
+        longEntryPx := strategy.position_avg_price
+        longRiskDist := stopDistLong
+        longHighSinceEntry := high
+        dynLongStop := longEntryPx - longRiskDist
+    longHighSinceEntry := na(longHighSinceEntry) ? high : math.max(longHighSinceEntry, high)
+
+    // Favorable move in R from entry.
+    rNowLong = longRiskDist > 0 ? ((longHighSinceEntry - longEntryPx) / longRiskDist) : 0.0
+    stopCandidateLong = longEntryPx - longRiskDist
+    if rNowLong >= 1.0
+        // 1.0R achieved: SL -> break-even.
+        stopCandidateLong := math.max(stopCandidateLong, longEntryPx)
+        // Additional 0.5R step updates.
+        longStepIdx = math.floor((rNowLong - 1.0) / 0.5)
+        if longStepIdx >= 1
+            lockR = 0.75 + (0.5 * longStepIdx)
+            stopCandidateLong := math.max(stopCandidateLong, longEntryPx + (lockR * longRiskDist))
+    dynLongStop := na(dynLongStop) ? stopCandidateLong : math.max(dynLongStop, stopCandidateLong)
+
+if strategy.position_size < 0
+    if na(shortEntryPx) or na(shortRiskDist)
+        shortEntryPx := strategy.position_avg_price
+        shortRiskDist := stopDistShort
+        shortLowSinceEntry := low
+        dynShortStop := shortEntryPx + shortRiskDist
+    shortLowSinceEntry := na(shortLowSinceEntry) ? low : math.min(shortLowSinceEntry, low)
+
+    // Favorable move in R from entry.
+    rNowShort = shortRiskDist > 0 ? ((shortEntryPx - shortLowSinceEntry) / shortRiskDist) : 0.0
+    stopCandidateShort = shortEntryPx + shortRiskDist
+    if rNowShort >= 1.0
+        // 1.0R achieved: SL -> break-even.
+        stopCandidateShort := math.min(stopCandidateShort, shortEntryPx)
+        // Additional 0.5R step updates.
+        shortStepIdx = math.floor((rNowShort - 1.0) / 0.5)
+        if shortStepIdx >= 1
+            lockR = 0.75 + (0.5 * shortStepIdx)
+            stopCandidateShort := math.min(stopCandidateShort, shortEntryPx - (lockR * shortRiskDist))
+    dynShortStop := na(dynShortStop) ? stopCandidateShort : math.min(dynShortStop, stopCandidateShort)
+
+if justFlat
+    longEntryPx := na
+    shortEntryPx := na
+    longRiskDist := na
+    shortRiskDist := na
+    longHighSinceEntry := na
+    shortLowSinceEntry := na
+    dynLongStop := na
+    dynShortStop := na
+    longPosIsScalp := false
+    shortPosIsScalp := false
+
+// SL modify timing gate:
+// - intrabar when pcIntrabarSLUpdates=true
+// - otherwise on 1m candle close
+modGateCloseTime = request.security(syminfo.tickerid, "1", time_close, barmerge.gaps_off, barmerge.lookahead_off)
+isNewModGateClose = not na(modGateCloseTime[1]) and modGateCloseTime != modGateCloseTime[1]
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Anti-spam: 1 alert per bar
+// ─────────────────────────────────────────────────────────────────────────────
+var int lastEntryAlertBar = na
+entryBarOk = not oneAlertPerBar or na(lastEntryAlertBar) or bar_index > lastEntryAlertBar
+
+// PineConnector command builders (absolute SL/TP prices) — includes tag as comment
+f_pc_buy(_sl, _tp, _tag) =>
+    string msg = ""
+    if useTrailingSL
+        msg := str.format("{0},CLS+OL,{1},risk={2},sl_price={3},comment={4}",
+          pcID, pcSymbol, str.tostring(pcRiskLots), str.tostring(_sl), _tag)
+    else
+        msg := str.format("{0},CLS+OL,{1},risk={2},sl_price={3},tp_price={4},comment={5}",
+          pcID, pcSymbol, str.tostring(pcRiskLots), str.tostring(_sl), str.tostring(_tp), _tag)
+    msg
+
+f_pc_sell(_sl, _tp, _tag) =>
+    string msg = ""
+    if useTrailingSL
+        msg := str.format("{0},CLS+OS,{1},risk={2},sl_price={3},comment={4}",
+          pcID, pcSymbol, str.tostring(pcRiskLots), str.tostring(_sl), _tag)
+    else
+        msg := str.format("{0},CLS+OS,{1},risk={2},sl_price={3},tp_price={4},comment={5}",
+          pcID, pcSymbol, str.tostring(pcRiskLots), str.tostring(_sl), str.tostring(_tp), _tag)
+    msg
+
+f_pc_mod_long_sl(_sl) =>
+    slTxt = str.tostring(math.round(_sl / syminfo.mintick) * syminfo.mintick, format.mintick)
+    pcUseLegacyModify ?
+      str.format("{0},newsltplong,{1},sl={2}", pcID, pcSymbol, slTxt) :
+      str.format("{0},newsltplong,{1},sl_price={2}", pcID, pcSymbol, slTxt)
+
+f_pc_mod_short_sl(_sl) =>
+    slTxt = str.tostring(math.round(_sl / syminfo.mintick) * syminfo.mintick, format.mintick)
+    pcUseLegacyModify ?
+      str.format("{0},newsltpshort,{1},sl={2}", pcID, pcSymbol, slTxt) :
+      str.format("{0},newsltpshort,{1},sl_price={2}", pcID, pcSymbol, slTxt)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Orders + Alerts
+// ─────────────────────────────────────────────────────────────────────────────
+var label lastSetupLbl = na
+var float lastSentLongSL = na
+var float lastSentShortSL = na
+var int lastLongModMs = na
+var int lastShortModMs = na
+var bool longEntryAlertSentForPos = false
+var bool shortEntryAlertSentForPos = false
+var int lastLongEntryAlertBar = na
+var int lastShortEntryAlertBar = na
+var int modWindowStartMs = na
+var int modWindowCount = 0
+var string lastWebhookPayload = ""
+var int lastWebhookMs = na
+var table entryAlertTbl = table.new(position.top_center, 1, 1, frame_color=color.new(color.black, 70), frame_width=1)
+if barstate.isfirst
+    table.cell(entryAlertTbl, 0, 0, "", text_color=color.white, text_size=size.tiny, bgcolor=color.new(color.black, 100))
+
+nowMs = timenow
+
+// Manual one-shot reset pulse (toggle input ON once, then OFF).
+var bool prevResetStrategyState = false
+resetPulse = resetStrategyState and not prevResetStrategyState
+prevResetStrategyState := resetStrategyState
+if resetPulse
+    strategy.close_all(comment="ManualReset")
+    longEntryAlertSentForPos := false
+    shortEntryAlertSentForPos := false
+    lastLongEntryAlertBar := na
+    lastShortEntryAlertBar := na
+    lastSentLongSL := na
+    lastSentShortSL := na
+    lastLongModMs := na
+    lastShortModMs := na
+    lastWebhookPayload := ""
+    lastWebhookMs := na
+    lastEntryAlertBar := na
+
+// Prevent conflicting long+short orders on the same bar.
+fireLong  = canTrade and volatilityOkLong and longSignal  and not shortSignal and strategy.position_size <= 0
+fireShort = canTrade and volatilityOkShort and shortSignal and not longSignal  and strategy.position_size >= 0
+
+if fireLong
+    longEntryId = longStructure ? "L-STRUCT" : longTrend ? "L-TREND" : "L-RANGE"
+    strategy.entry(longEntryId, strategy.long)
+    tradesToday += 1
+    longPosIsScalp := longIsScalpSetup
+
+    tag = f_setup_long()
+    label.delete(lastSetupLbl)
+    lastSetupLbl := label.new(bar_index, low, tag, style=label.style_label_up, textcolor=color.white, color=color.new(color.green, 0))
+
+    longPayload = f_pc_buy(longSL, longTP, tag)
+    longDupBlocked = pcDuplicateSuppressMs > 0 and not na(nowMs) and not na(lastWebhookMs) and longPayload == lastWebhookPayload and (nowMs - lastWebhookMs) <= pcDuplicateSuppressMs
+    if sendPCAlerts and entryBarOk and not longDupBlocked
+        alert(longPayload, alert.freq_once_per_bar_close)
+        lastEntryAlertBar := bar_index
+        lastLongEntryAlertBar := bar_index
+        longEntryAlertSentForPos := true
+        lastWebhookPayload := longPayload
+        lastWebhookMs := nowMs
+        if showEntryAlertDebug
+            dbgTxt = str.format("ENTRY ALERT SENT: CLS+OL | {0}", tag)
+            table.cell(entryAlertTbl, 0, 0, dbgTxt, text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.green, 75))
+    else if showEntryAlertDebug
+        skipReason = not sendPCAlerts ? "sendPCAlerts=OFF" : not entryBarOk ? "oneAlertPerBar gate" : "duplicate suppress"
+        dbgTxt = str.format("ENTRY ALERT SKIPPED: CLS+OL | {0} | {1}", tag, skipReason)
+        table.cell(entryAlertTbl, 0, 0, dbgTxt, text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.orange, 70))
+
+if fireShort
+    shortEntryId = shortStructure ? "S-STRUCT" : shortTrend ? "S-TREND" : "S-RANGE"
+    strategy.entry(shortEntryId, strategy.short)
+    tradesToday += 1
+    shortPosIsScalp := shortIsScalpSetup
+
+    tag = f_setup_short()
+    label.delete(lastSetupLbl)
+    lastSetupLbl := label.new(bar_index, high, tag, style=label.style_label_down, textcolor=color.black, color=color.new(color.red, 0))
+
+    shortPayload = f_pc_sell(shortSL, shortTP, tag)
+    shortDupBlocked = pcDuplicateSuppressMs > 0 and not na(nowMs) and not na(lastWebhookMs) and shortPayload == lastWebhookPayload and (nowMs - lastWebhookMs) <= pcDuplicateSuppressMs
+    if sendPCAlerts and entryBarOk and not shortDupBlocked
+        alert(shortPayload, alert.freq_once_per_bar_close)
+        lastEntryAlertBar := bar_index
+        lastShortEntryAlertBar := bar_index
+        shortEntryAlertSentForPos := true
+        lastWebhookPayload := shortPayload
+        lastWebhookMs := nowMs
+        if showEntryAlertDebug
+            dbgTxt = str.format("ENTRY ALERT SENT: CLS+OS | {0}", tag)
+            table.cell(entryAlertTbl, 0, 0, dbgTxt, text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.red, 75))
+    else if showEntryAlertDebug
+        skipReason = not sendPCAlerts ? "sendPCAlerts=OFF" : not entryBarOk ? "oneAlertPerBar gate" : "duplicate suppress"
+        dbgTxt = str.format("ENTRY ALERT SKIPPED: CLS+OS | {0} | {1}", tag, skipReason)
+        table.cell(entryAlertTbl, 0, 0, dbgTxt, text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.orange, 70))
+
+// Test mode: force webhook payloads on schedule to validate TV -> PineConnector -> MT5.
+forceTestFire = testMode and barOk and sendPCAlerts and entryBarOk and (bar_index % testEveryNBars == 0)
+if forceTestFire
+    testTag = "TEST:FORCED"
+    testPayload = testDirection == "Long" ? f_pc_buy(longSL, longTP, testTag) : f_pc_sell(shortSL, shortTP, testTag)
+    testDupBlocked = pcDuplicateSuppressMs > 0 and not na(nowMs) and not na(lastWebhookMs) and testPayload == lastWebhookPayload and (nowMs - lastWebhookMs) <= pcDuplicateSuppressMs
+    if not testDupBlocked
+        alert(testPayload, alert.freq_once_per_bar_close)
+        lastWebhookPayload := testPayload
+        lastWebhookMs := nowMs
+        lastEntryAlertBar := bar_index
+
+if newLongPos
+    lastSentLongSL := na
+    lastLongModMs := na
+if newShortPos
+    lastSentShortSL := na
+    lastShortModMs := na
+if justFlat
+    lastSentLongSL := na
+    lastSentShortSL := na
+    lastLongModMs := na
+    lastShortModMs := na
+    longEntryAlertSentForPos := false
+    shortEntryAlertSentForPos := false
+    lastLongEntryAlertBar := na
+    lastShortEntryAlertBar := na
+
+// Send SL modification alerts to MT5 so PineConnector follows strategy trailing/BE behavior.
+if na(modWindowStartMs) or (not na(nowMs) and nowMs - modWindowStartMs >= 60000)
+    modWindowStartMs := nowMs
+    modWindowCount := 0
+modRateOk = pcMaxSLModsPerMinute <= 0 or modWindowCount < pcMaxSLModsPerMinute
+longEntryReadyForMods = not pcRequireEntryAlertBeforeSLMods or longEntryAlertSentForPos
+shortEntryReadyForMods = not pcRequireEntryAlertBeforeSLMods or shortEntryAlertSentForPos
+longAfterEntryBarOk = na(lastLongEntryAlertBar) or bar_index > lastLongEntryAlertBar
+shortAfterEntryBarOk = na(lastShortEntryAlertBar) or bar_index > lastShortEntryAlertBar
+longRNow = not na(longEntryPx) and not na(longRiskDist) and longRiskDist > 0 ? (longHighSinceEntry - longEntryPx) / longRiskDist : 0.0
+shortRNow = not na(shortEntryPx) and not na(shortRiskDist) and shortRiskDist > 0 ? (shortEntryPx - shortLowSinceEntry) / shortRiskDist : 0.0
+longReachedModR = longRNow >= pcModStartR
+shortReachedModR = shortRNow >= pcModStartR
+longModCooldownOk = pcMinSecondsBetweenSLMods <= 0 or na(lastLongModMs) or (not na(nowMs) and (nowMs - lastLongModMs) >= pcMinSecondsBetweenSLMods * 1000)
+shortModCooldownOk = pcMinSecondsBetweenSLMods <= 0 or na(lastShortModMs) or (not na(nowMs) and (nowMs - lastShortModMs) >= pcMinSecondsBetweenSLMods * 1000)
+modLongDistanceOk  = pcMinModifyGap <= 0.0 or dynLongStop <= (close - pcMinModifyGap)
+modShortDistanceOk = pcMinModifyGap <= 0.0 or dynShortStop >= (close + pcMinModifyGap)
+modTimingOk = pcIntrabarSLUpdates ? barstate.isrealtime : isNewModGateClose
+longSLAdvanced  = useTrailingSL and strategy.position_size > 0 and not na(dynLongStop) and modTimingOk and longReachedModR and longEntryReadyForMods and longAfterEntryBarOk and modRateOk and modLongDistanceOk and longModCooldownOk and (na(lastSentLongSL) or dynLongStop > lastSentLongSL + syminfo.mintick)
+shortSLAdvanced = useTrailingSL and strategy.position_size < 0 and not na(dynShortStop) and modTimingOk and shortReachedModR and shortEntryReadyForMods and shortAfterEntryBarOk and modRateOk and modShortDistanceOk and shortModCooldownOk and (na(lastSentShortSL) or dynShortStop < lastSentShortSL - syminfo.mintick)
+
+if sendPCAlerts and barstate.isrealtime and longSLAdvanced
+    longModPayload = f_pc_mod_long_sl(dynLongStop)
+    longModDupBlocked = pcDuplicateSuppressMs > 0 and not na(nowMs) and not na(lastWebhookMs) and longModPayload == lastWebhookPayload and (nowMs - lastWebhookMs) <= pcDuplicateSuppressMs
+    if not longModDupBlocked
+        alert(longModPayload, pcIntrabarSLUpdates ? alert.freq_all : alert.freq_once_per_bar_close)
+        lastSentLongSL := dynLongStop
+        lastLongModMs := nowMs
+        lastWebhookPayload := longModPayload
+        lastWebhookMs := nowMs
+        modWindowCount += 1
+
+if sendPCAlerts and barstate.isrealtime and shortSLAdvanced
+    shortModPayload = f_pc_mod_short_sl(dynShortStop)
+    shortModDupBlocked = pcDuplicateSuppressMs > 0 and not na(nowMs) and not na(lastWebhookMs) and shortModPayload == lastWebhookPayload and (nowMs - lastWebhookMs) <= pcDuplicateSuppressMs
+    if not shortModDupBlocked
+        alert(shortModPayload, pcIntrabarSLUpdates ? alert.freq_all : alert.freq_once_per_bar_close)
+        lastSentShortSL := dynShortStop
+        lastShortModMs := nowMs
+        lastWebhookPayload := shortModPayload
+        lastWebhookMs := nowMs
+        modWindowCount += 1
+
+if not showEntryAlertDebug
+    table.cell(entryAlertTbl, 0, 0, "", text_color=color.white, text_size=size.tiny, bgcolor=color.new(color.black, 100))
+
+// Keep previous position size per script update (tick/bar) for one-shot transition detection.
+posSizePrevTick := strategy.position_size
+
+
+// Strategy exits (visual backtest) — MT5 side uses SL/TP you send
+if strategy.position_size > 0
+    strategy.exit("L-TREND-exit", "L-TREND", stop=useTrailingSL ? dynLongStop : longSL, limit=useTrailingSL ? na : longTP)
+    strategy.exit("L-RANGE-exit", "L-RANGE", stop=useTrailingSL ? dynLongStop : longSL, limit=useTrailingSL ? na : longTP)
+    strategy.exit("L-STRUCT-exit", "L-STRUCT", stop=useTrailingSL ? dynLongStop : longSL, limit=useTrailingSL ? na : longTP)
+
+if strategy.position_size < 0
+    strategy.exit("S-TREND-exit", "S-TREND", stop=useTrailingSL ? dynShortStop : shortSL, limit=useTrailingSL ? na : shortTP)
+    strategy.exit("S-RANGE-exit", "S-RANGE", stop=useTrailingSL ? dynShortStop : shortSL, limit=useTrailingSL ? na : shortTP)
+    strategy.exit("S-STRUCT-exit", "S-STRUCT", stop=useTrailingSL ? dynShortStop : shortSL, limit=useTrailingSL ? na : shortTP)
+
+// Setup-level closed trade stats (across long+short)
+var int lastProcessedClosed = 0
+var int trendCount = 0
+var int trendWins = 0
+var float trendPnL = 0.0
+var int scalpCount = 0
+var int scalpWins = 0
+var float scalpPnL = 0.0
+var int structCount = 0
+var int structWins = 0
+var float structPnL = 0.0
+
+closedNow = strategy.closedtrades
+if closedNow > lastProcessedClosed
+    for i = lastProcessedClosed to closedNow - 1
+        eId = strategy.closedtrades.entry_id(i)
+        p = strategy.closedtrades.profit(i)
+        if str.contains(eId, "TREND")
+            trendCount += 1
+            trendPnL += p
+            if p > 0
+                trendWins += 1
+        else if str.contains(eId, "RANGE")
+            scalpCount += 1
+            scalpPnL += p
+            if p > 0
+                scalpWins += 1
+        else if str.contains(eId, "STRUCT")
+            structCount += 1
+            structPnL += p
+            if p > 0
+                structWins += 1
+    lastProcessedClosed := closedNow
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Visuals / Debug
+// ─────────────────────────────────────────────────────────────────────────────
+plot(ema21,  "EMA21",  color=color.new(color.yellow, 0))
+plot(ema50,  "EMA50",  color=color.new(color.blue, 0))
+plot(ema200, "EMA200", color=color.new(color.green, 0))
+
+plot(lastSup, "HTF Support (Pivot Low)", color=color.new(color.teal, 0), style=plot.style_linebr, linewidth=2)
+plot(lastRes, "HTF Resistance (Pivot High)", color=color.new(color.red, 0), style=plot.style_linebr, linewidth=2)
+
+plotchar(dailyStop, "Daily Stop Active", "⛔", location=location.top, color=color.red)
+plotchar(canTrade,  "Can Trade",        "✅", location=location.top, color=color.green)
+
+plotchar(sweepHigh, "Sweep High", "↧", location=location.top, color=color.red)
+plotchar(sweepLow,  "Sweep Low",  "↥", location=location.top, color=color.lime)
+
+plotchar(bullBOS, "Bull BOS", "BOS↑", location=location.top, color=color.lime)
+plotchar(bearBOS, "Bear BOS", "BOS↓", location=location.top, color=color.red)
+
+var table regimeTbl = table.new(position.top_right, 1, 1, frame_color=color.new(color.black, 70), frame_width=1)
+if barOk
+    txt = str.format("{0} (ADX {1}) | StopCap L/S=${2}/${3} | stopDist L/S={4}/{5}",
+         trendMode ? "REGIME: TREND" : "REGIME: RANGE",
+         str.tostring(adx, "#.0"),
+         str.tostring(maxRiskUsdLong, "#.0"),
+         str.tostring(maxRiskUsdShort, "#.0"),
+         str.tostring(stopDistLong, "#.00"),
+         str.tostring(stopDistShort, "#.00"))
+    table.cell(regimeTbl, 0, 0, txt, text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 70))
+
+var table setupTbl = table.new(position.middle_right, 4, 4, frame_color=color.new(color.black, 70), frame_width=1)
+if barstate.isfirst
+    table.cell(setupTbl, 0, 0, "Template", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 70))
+    table.cell(setupTbl, 1, 0, "Trades", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 70))
+    table.cell(setupTbl, 2, 0, "Win%", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 70))
+    table.cell(setupTbl, 3, 0, "Net", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 70))
+
+if showSetupReport
+    trendWinPct = trendCount > 0 ? (100.0 * trendWins / trendCount) : 0.0
+    scalpWinPct = scalpCount > 0 ? (100.0 * scalpWins / scalpCount) : 0.0
+    structWinPct = structCount > 0 ? (100.0 * structWins / structCount) : 0.0
+
+    table.cell(setupTbl, 0, 1, "Intraday", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(setupTbl, 1, 1, str.tostring(trendCount), text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(setupTbl, 2, 1, str.tostring(trendWinPct, "#.0"), text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(setupTbl, 3, 1, str.tostring(trendPnL, "#.00"), text_color=trendPnL >= 0 ? color.lime : color.red, text_size=size.tiny, bgcolor=color.new(color.black, 85))
+
+    table.cell(setupTbl, 0, 2, "Scalp", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(setupTbl, 1, 2, str.tostring(scalpCount), text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(setupTbl, 2, 2, str.tostring(scalpWinPct, "#.0"), text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(setupTbl, 3, 2, str.tostring(scalpPnL, "#.00"), text_color=scalpPnL >= 0 ? color.lime : color.red, text_size=size.tiny, bgcolor=color.new(color.black, 85))
+
+    table.cell(setupTbl, 0, 3, "Structure", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(setupTbl, 1, 3, str.tostring(structCount), text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(setupTbl, 2, 3, str.tostring(structWinPct, "#.0"), text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(setupTbl, 3, 3, str.tostring(structPnL, "#.00"), text_color=structPnL >= 0 ? color.lime : color.red, text_size=size.tiny, bgcolor=color.new(color.black, 85))
+else
+    for r = 1 to 3
+        for c = 0 to 3
+            table.cell(setupTbl, c, r, "", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 100))
+
+f_dbg_ok(_b) =>
+    _b ? "OK" : "BLOCK"
+
+f_dbg_col(_b) =>
+    _b ? color.lime : color.red
+
+f_gate_txt(_b) =>
+    _b ? "OK" : "BLOCK"
+
+var table gateTbl = table.new(position.bottom_center, 12, 3, frame_color=color.new(color.black, 70), frame_width=1)
+if barstate.isfirst
+    table.cell(gateTbl, 0, 0, "Side", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 70))
+    table.cell(gateTbl, 1, 0, "canTrade", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 70))
+    table.cell(gateTbl, 2, 0, "vol", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 70))
+    table.cell(gateTbl, 3, 0, "S/R", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 70))
+    table.cell(gateTbl, 4, 0, "MACD", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 70))
+    table.cell(gateTbl, 5, 0, "RSI", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 70))
+    table.cell(gateTbl, 6, 0, "Conf 3", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 70))
+    table.cell(gateTbl, 7, 0, "Conf 4", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 70))
+    table.cell(gateTbl, 8, 0, "Conf 5", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 70))
+    table.cell(gateTbl, 9, 0, "Block 1", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 70))
+    table.cell(gateTbl, 10, 0, "Block 2", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 70))
+    table.cell(gateTbl, 11, 0, "Block 3", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 70))
+
+showGateTable = showLongBlockDebug or showShortBlockDebug
+
+if showGateTable
+    // In this compact gate table, S/R reflects room-to-opposite-level.
+    // Trigger/retest logic is tracked elsewhere in raw/confluence checks.
+    longSROk = roomLongOk
+    shortSROk = roomShortOk
+    longMacdOk = longConfMacd
+    shortMacdOk = shortConfMacd
+    longRsiOk = longConfRsi
+    shortRsiOk = shortConfRsi
+    // Template status must represent template evidence only (separate from confluence adequacy).
+    longTplOk = longTemplateEvidence
+    shortTplOk = shortTemplateEvidence
+
+    // Additional confluences (first 3 positives beyond S/R + MACD + RSI)
+    string lConf3 = "BLOCK"
+    string lConf4 = ""
+    string lConf5 = ""
+    int lConfHits = 0
+    if longConfRegime
+        lConfHits += 1
+        if lConfHits == 1
+            lConf3 := "Reg"
+        else if lConfHits == 2
+            lConf4 := "Reg"
+        else if lConfHits == 3
+            lConf5 := "Reg"
+    if longConfStack
+        lConfHits += 1
+        if lConfHits == 1
+            lConf3 := "Stack"
+        else if lConfHits == 2
+            lConf4 := "Stack"
+        else if lConfHits == 3
+            lConf5 := "Stack"
+    if longConfPrice
+        lConfHits += 1
+        if lConfHits == 1
+            lConf3 := "Price"
+        else if lConfHits == 2
+            lConf4 := "Price"
+        else if lConfHits == 3
+            lConf5 := "Price"
+    if longConfStructure
+        lConfHits += 1
+        if lConfHits == 1
+            lConf3 := "Struct"
+        else if lConfHits == 2
+            lConf4 := "Struct"
+        else if lConfHits == 3
+            lConf5 := "Struct"
+    if longConfFvg
+        lConfHits += 1
+        if lConfHits == 1
+            lConf3 := "FVG"
+        else if lConfHits == 2
+            lConf4 := "FVG"
+        else if lConfHits == 3
+            lConf5 := "FVG"
+    if longConfAdx
+        lConfHits += 1
+        if lConfHits == 1
+            lConf3 := "ADX"
+        else if lConfHits == 2
+            lConf4 := "ADX"
+        else if lConfHits == 3
+            lConf5 := "ADX"
+    if longConfBias
+        lConfHits += 1
+        if lConfHits == 1
+            lConf3 := "Bias"
+        else if lConfHits == 2
+            lConf4 := "Bias"
+        else if lConfHits == 3
+            lConf5 := "Bias"
+    if longConfCtx
+        lConfHits += 1
+        if lConfHits == 1
+            lConf3 := "Ctx"
+        else if lConfHits == 2
+            lConf4 := "Ctx"
+        else if lConfHits == 3
+            lConf5 := "Ctx"
+
+    string sConf3 = "BLOCK"
+    string sConf4 = ""
+    string sConf5 = ""
+    int sConfHits = 0
+    if shortConfRegime
+        sConfHits += 1
+        if sConfHits == 1
+            sConf3 := "Reg"
+        else if sConfHits == 2
+            sConf4 := "Reg"
+        else if sConfHits == 3
+            sConf5 := "Reg"
+    if shortConfStack
+        sConfHits += 1
+        if sConfHits == 1
+            sConf3 := "Stack"
+        else if sConfHits == 2
+            sConf4 := "Stack"
+        else if sConfHits == 3
+            sConf5 := "Stack"
+    if shortConfPrice
+        sConfHits += 1
+        if sConfHits == 1
+            sConf3 := "Price"
+        else if sConfHits == 2
+            sConf4 := "Price"
+        else if sConfHits == 3
+            sConf5 := "Price"
+    if shortConfStructure
+        sConfHits += 1
+        if sConfHits == 1
+            sConf3 := "Struct"
+        else if sConfHits == 2
+            sConf4 := "Struct"
+        else if sConfHits == 3
+            sConf5 := "Struct"
+    if shortConfFvg
+        sConfHits += 1
+        if sConfHits == 1
+            sConf3 := "FVG"
+        else if sConfHits == 2
+            sConf4 := "FVG"
+        else if sConfHits == 3
+            sConf5 := "FVG"
+    if shortConfAdx
+        sConfHits += 1
+        if sConfHits == 1
+            sConf3 := "ADX"
+        else if sConfHits == 2
+            sConf4 := "ADX"
+        else if sConfHits == 3
+            sConf5 := "ADX"
+    if shortConfBias
+        sConfHits += 1
+        if sConfHits == 1
+            sConf3 := "Bias"
+        else if sConfHits == 2
+            sConf4 := "Bias"
+        else if sConfHits == 3
+            sConf5 := "Bias"
+    if shortConfCtx
+        sConfHits += 1
+        if sConfHits == 1
+            sConf3 := "Ctx"
+        else if sConfHits == 2
+            sConf4 := "Ctx"
+        else if sConfHits == 3
+            sConf5 := "Ctx"
+
+    // First 3 blockers (ordered, first-hit priority)
+    string lBlk1 = "-"
+    string lBlk2 = "-"
+    string lBlk3 = "-"
+    int lBlkN = 0
+    if not longTplOk
+        lBlkN += 1
+        if lBlkN == 1
+            lBlk1 := "Template"
+        else if lBlkN == 2
+            lBlk2 := "Template"
+        else if lBlkN == 3
+            lBlk3 := "Template"
+    if not useLong
+        lBlkN += 1
+        if lBlkN == 1
+            lBlk1 := "LongDisabled"
+        else if lBlkN == 2
+            lBlk2 := "LongDisabled"
+        else if lBlkN == 3
+            lBlk3 := "LongDisabled"
+    if strategy.position_size > 0
+        lBlkN += 1
+        if lBlkN == 1
+            lBlk1 := "InLong"
+        else if lBlkN == 2
+            lBlk2 := "InLong"
+        else if lBlkN == 3
+            lBlk3 := "InLong"
+    if shortSignal
+        lBlkN += 1
+        if lBlkN == 1
+            lBlk1 := "OppSignal"
+        else if lBlkN == 2
+            lBlk2 := "OppSignal"
+        else if lBlkN == 3
+            lBlk3 := "OppSignal"
+
+    string sBlk1 = "-"
+    string sBlk2 = "-"
+    string sBlk3 = "-"
+    int sBlkN = 0
+    if not shortTplOk
+        sBlkN += 1
+        if sBlkN == 1
+            sBlk1 := "Template"
+        else if sBlkN == 2
+            sBlk2 := "Template"
+        else if sBlkN == 3
+            sBlk3 := "Template"
+    if not useShort
+        sBlkN += 1
+        if sBlkN == 1
+            sBlk1 := "ShortDisabled"
+        else if sBlkN == 2
+            sBlk2 := "ShortDisabled"
+        else if sBlkN == 3
+            sBlk3 := "ShortDisabled"
+    if strategy.position_size < 0
+        sBlkN += 1
+        if sBlkN == 1
+            sBlk1 := "InShort"
+        else if sBlkN == 2
+            sBlk2 := "InShort"
+        else if sBlkN == 3
+            sBlk3 := "InShort"
+    if longSignal
+        sBlkN += 1
+        if sBlkN == 1
+            sBlk1 := "OppSignal"
+        else if sBlkN == 2
+            sBlk2 := "OppSignal"
+        else if sBlkN == 3
+            sBlk3 := "OppSignal"
+
+    // Long row
+    table.cell(gateTbl, 0, 1, "Long", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(gateTbl, 1, 1, f_gate_txt(canTrade), text_color=f_dbg_col(canTrade), text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(gateTbl, 2, 1, f_gate_txt(volatilityOkLong), text_color=f_dbg_col(volatilityOkLong), text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(gateTbl, 3, 1, f_gate_txt(longSROk), text_color=f_dbg_col(longSROk), text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(gateTbl, 4, 1, f_gate_txt(longMacdOk), text_color=f_dbg_col(longMacdOk), text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(gateTbl, 5, 1, f_gate_txt(longRsiOk), text_color=f_dbg_col(longRsiOk), text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(gateTbl, 6, 1, lConf3, text_color=lConf3 == "BLOCK" ? color.red : color.lime, text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(gateTbl, 7, 1, lConf4, text_color=lConf4 == "" ? color.gray : color.lime, text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(gateTbl, 8, 1, lConf5, text_color=lConf5 == "" ? color.gray : color.lime, text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(gateTbl, 9, 1, lBlk1, text_color=lBlk1 == "-" ? color.lime : color.red, text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(gateTbl, 10, 1, lBlk2, text_color=lBlk2 == "-" ? color.lime : color.red, text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(gateTbl, 11, 1, lBlk3, text_color=lBlk3 == "-" ? color.lime : color.red, text_size=size.tiny, bgcolor=color.new(color.black, 85))
+
+    // Short row
+    table.cell(gateTbl, 0, 2, "Short", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(gateTbl, 1, 2, f_gate_txt(canTrade), text_color=f_dbg_col(canTrade), text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(gateTbl, 2, 2, f_gate_txt(volatilityOkShort), text_color=f_dbg_col(volatilityOkShort), text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(gateTbl, 3, 2, f_gate_txt(shortSROk), text_color=f_dbg_col(shortSROk), text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(gateTbl, 4, 2, f_gate_txt(shortMacdOk), text_color=f_dbg_col(shortMacdOk), text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(gateTbl, 5, 2, f_gate_txt(shortRsiOk), text_color=f_dbg_col(shortRsiOk), text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(gateTbl, 6, 2, sConf3, text_color=sConf3 == "BLOCK" ? color.red : color.lime, text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(gateTbl, 7, 2, sConf4, text_color=sConf4 == "" ? color.gray : color.lime, text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(gateTbl, 8, 2, sConf5, text_color=sConf5 == "" ? color.gray : color.lime, text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(gateTbl, 9, 2, sBlk1, text_color=sBlk1 == "-" ? color.lime : color.red, text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(gateTbl, 10, 2, sBlk2, text_color=sBlk2 == "-" ? color.lime : color.red, text_size=size.tiny, bgcolor=color.new(color.black, 85))
+    table.cell(gateTbl, 11, 2, sBlk3, text_color=sBlk3 == "-" ? color.lime : color.red, text_size=size.tiny, bgcolor=color.new(color.black, 85))
+else
+    for r = 1 to 2
+        for c = 0 to 11
+            table.cell(gateTbl, c, r, "", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 100))

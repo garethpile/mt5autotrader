@@ -1,0 +1,534 @@
+//@version=5
+strategy("XAUUSD Basic Trader V1.2",
+     overlay=true,
+     calc_on_every_tick=true,
+     process_orders_on_close=true,
+     initial_capital=1000,
+     commission_type=strategy.commission.percent,
+     commission_value=0.0)
+
+// -----------------------------------------------------------------------------
+// PineConnector
+// -----------------------------------------------------------------------------
+groupPC  = "PineConnector (MT5 Automation)"
+pcID     = input.string("YOUR_LICENSE_ID", "PineConnector License ID", group=groupPC)
+pcSymbol = input.string("XAUUSD", "MT5 Symbol", group=groupPC)
+pcRiskLots = input.float(0.01, "risk= LOTS (fixed)", group=groupPC, step=0.01)
+
+sendPCAlerts   = input.bool(true, "Send PineConnector webhooks", group=groupPC)
+pcUseLegacyModify = input.bool(true, "Use legacy sl= for SL modify", group=groupPC)
+pcMinModifyGap = input.float(0.5, "Min gap for SL modify ($)", group=groupPC, step=0.1, minval=0.0)
+pcIntrabarSLUpdates = input.bool(true, "Intrabar SL modify alerts", group=groupPC)
+pcMinSecondsBetweenSLMods = input.int(5, "Min seconds between SL modify alerts", group=groupPC, minval=0)
+pcRequireEntryAlertBeforeSLMods = input.bool(true, "Require entry alert before SL modifies", group=groupPC)
+pcMaxSLModsPerMinute = input.int(12, "Max SL modify alerts per minute (0=off)", group=groupPC, minval=0)
+pcDuplicateSuppressMs = input.int(1500, "Suppress duplicate payloads within ms", group=groupPC, minval=0)
+pcModStartR = input.float(2.0, "Start SL modify at R multiple", group=groupPC, step=0.25, minval=0.5)
+
+// -----------------------------------------------------------------------------
+// Core execution model
+// -----------------------------------------------------------------------------
+groupExec = "Execution"
+signalTF = "5"
+useLong = input.bool(true, "Enable Longs", group=groupExec)
+useShort = input.bool(true, "Enable Shorts", group=groupExec)
+
+sigCloseTime = request.security(syminfo.tickerid, signalTF, time_close, barmerge.gaps_off, barmerge.lookahead_off)
+isNewSignalClose = not na(sigCloseTime[1]) and sigCloseTime != sigCloseTime[1]
+barOk = isNewSignalClose and barstate.isconfirmed
+
+// -----------------------------------------------------------------------------
+// Must-have filters
+// -----------------------------------------------------------------------------
+groupFilters = "Must-Have Filters"
+rsiLen = input.int(14, "RSI Length", group=groupFilters, minval=1)
+rsiLongMin = input.float(52.0, "RSI Long Min", group=groupFilters, step=0.5)
+rsiLongMax = input.float(85.0, "RSI Long Max", group=groupFilters, step=0.5)
+rsiShortMin = input.float(30.0, "RSI Short Min", group=groupFilters, step=0.5)
+rsiShortMax = input.float(48.0, "RSI Short Max", group=groupFilters, step=0.5)
+rsiTurnOB = input.float(85.0, "RSI Overbought (turn short)", group=groupFilters, step=0.5)
+rsiTurnOS = input.float(30.0, "RSI Oversold (turn long)", group=groupFilters, step=0.5)
+
+macdFast = input.int(12, "MACD Fast", group=groupFilters, minval=1)
+macdSlow = input.int(26, "MACD Slow", group=groupFilters, minval=1)
+macdSig = input.int(9, "MACD Signal", group=groupFilters, minval=1)
+
+adxLen = input.int(14, "ADX Length", group=groupFilters, minval=1)
+adxMin = input.float(20.0, "Trend strength min (ADX)", group=groupFilters, step=0.5)
+
+srLookback = input.int(20, "S/R lookback bars", group=groupFilters, minval=5)
+minRoomATR = input.float(0.8, "Min room to S/R (ATR)", group=groupFilters, step=0.1, minval=0.0)
+
+trend1mFast = input.int(21, "1m trend EMA fast", group=groupFilters, minval=1)
+trend1mSlow = input.int(50, "1m trend EMA slow", group=groupFilters, minval=1)
+useWickFilter = input.bool(true, "Use previous-candle wick exhaustion filter", group=groupFilters)
+wickMaxFrac = input.float(0.40, "Max wick fraction of candle range", group=groupFilters, step=0.05, minval=0.0, maxval=1.0)
+wickMaxBodyMult = input.float(1.50, "Max wick/body ratio", group=groupFilters, step=0.1, minval=0.0)
+
+// -----------------------------------------------------------------------------
+// Risk / trailing
+// -----------------------------------------------------------------------------
+groupRisk = "Risk & Trailing"
+maxRiskUsd = input.float(10.0, "Max risk per trade ($)", group=groupRisk, step=0.5)
+maxRiskUsdScalp = input.float(2.0, "Max risk per scalp trade ($)", group=groupRisk, step=0.5)
+usdPer1Move_001lot = input.float(1.0, "USD per $1 move at 0.01 lot", group=groupRisk, step=0.1, minval=0.0001)
+
+maxSL_ATR = input.float(1.0, "ATR stop multiplier", group=groupRisk, step=0.1)
+minSL_ATR = input.float(0.20, "Min stop (ATR multiple)", group=groupRisk, step=0.05)
+tpR = input.float(2.0, "Take Profit at R multiple", group=groupRisk, step=0.25)
+maxStopDist = input.float(7.0, "Max stop distance ($, 0=off)", group=groupRisk, step=0.25, minval=0.0)
+useTrailingSL = input.bool(true, "Use trailing SL instead of fixed TP", group=groupRisk)
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+f_macd_line(_src, _fast, _slow) =>
+    ta.ema(_src, _fast) - ta.ema(_src, _slow)
+
+f_macd_signal(_src, _fast, _slow, _sig) =>
+    ta.ema(f_macd_line(_src, _fast, _slow), _sig)
+
+// Stable DMI/ADX helpers (avoid platform-specific ta.adx / ta.plusdi / ta.minusdi issues)
+f_plus_di(_len) =>
+    upMove = high - high[1]
+    downMove = low[1] - low
+    plusDM = (upMove > downMove and upMove > 0) ? upMove : 0.0
+    tr = ta.tr(true)
+    atr_ = ta.rma(tr, _len)
+    plusDM_rma = ta.rma(plusDM, _len)
+    atr_ != 0.0 ? (100.0 * plusDM_rma / atr_) : 0.0
+
+f_minus_di(_len) =>
+    upMove = high - high[1]
+    downMove = low[1] - low
+    minusDM = (downMove > upMove and downMove > 0) ? downMove : 0.0
+    tr = ta.tr(true)
+    atr_ = ta.rma(tr, _len)
+    minusDM_rma = ta.rma(minusDM, _len)
+    atr_ != 0.0 ? (100.0 * minusDM_rma / atr_) : 0.0
+
+f_adx(_len) =>
+    plusDI = f_plus_di(_len)
+    minusDI = f_minus_di(_len)
+    sumDI = plusDI + minusDI
+    dx = sumDI != 0.0 ? (100.0 * math.abs(plusDI - minusDI) / sumDI) : 0.0
+    ta.rma(dx, _len)
+
+f_pc_buy(_sl, _tp, _tag) =>
+    string msg = ""
+    if useTrailingSL
+        msg := str.format("{0},CLS+OL,{1},risk={2},sl_price={3},comment={4}", pcID, pcSymbol, str.tostring(pcRiskLots), str.tostring(_sl), _tag)
+    else
+        msg := str.format("{0},CLS+OL,{1},risk={2},sl_price={3},tp_price={4},comment={5}", pcID, pcSymbol, str.tostring(pcRiskLots), str.tostring(_sl), str.tostring(_tp), _tag)
+    msg
+
+f_pc_sell(_sl, _tp, _tag) =>
+    string msg = ""
+    if useTrailingSL
+        msg := str.format("{0},CLS+OS,{1},risk={2},sl_price={3},comment={4}", pcID, pcSymbol, str.tostring(pcRiskLots), str.tostring(_sl), _tag)
+    else
+        msg := str.format("{0},CLS+OS,{1},risk={2},sl_price={3},tp_price={4},comment={5}", pcID, pcSymbol, str.tostring(pcRiskLots), str.tostring(_sl), str.tostring(_tp), _tag)
+    msg
+
+f_pc_mod_long_sl(_sl) =>
+    slTxt = str.tostring(math.round(_sl / syminfo.mintick) * syminfo.mintick, format.mintick)
+    pcUseLegacyModify ? str.format("{0},newsltplong,{1},sl={2}", pcID, pcSymbol, slTxt) : str.format("{0},newsltplong,{1},sl_price={2}", pcID, pcSymbol, slTxt)
+
+f_pc_mod_short_sl(_sl) =>
+    slTxt = str.tostring(math.round(_sl / syminfo.mintick) * syminfo.mintick, format.mintick)
+    pcUseLegacyModify ? str.format("{0},newsltpshort,{1},sl={2}", pcID, pcSymbol, slTxt) : str.format("{0},newsltpshort,{1},sl_price={2}", pcID, pcSymbol, slTxt)
+
+f_ok(_b) =>
+    _b ? "OK" : "BLOCK"
+
+f_col(_b) =>
+    _b ? color.lime : color.red
+
+// -----------------------------------------------------------------------------
+// Signal timeframe series
+// -----------------------------------------------------------------------------
+sigOpen = request.security(syminfo.tickerid, signalTF, open, barmerge.gaps_off, barmerge.lookahead_off)
+sigHigh = request.security(syminfo.tickerid, signalTF, high, barmerge.gaps_off, barmerge.lookahead_off)
+sigLow = request.security(syminfo.tickerid, signalTF, low, barmerge.gaps_off, barmerge.lookahead_off)
+sigClose = request.security(syminfo.tickerid, signalTF, close, barmerge.gaps_off, barmerge.lookahead_off)
+
+atrSig = request.security(syminfo.tickerid, signalTF, ta.atr(14), barmerge.gaps_off, barmerge.lookahead_off)
+rsiSig = request.security(syminfo.tickerid, signalTF, ta.rsi(close, rsiLen), barmerge.gaps_off, barmerge.lookahead_off)
+macdLineSig = request.security(syminfo.tickerid, signalTF, f_macd_line(close, macdFast, macdSlow), barmerge.gaps_off, barmerge.lookahead_off)
+macdSigSig = request.security(syminfo.tickerid, signalTF, f_macd_signal(close, macdFast, macdSlow, macdSig), barmerge.gaps_off, barmerge.lookahead_off)
+macdHistSig = macdLineSig - macdSigSig
+adxSig = request.security(syminfo.tickerid, signalTF, f_adx(adxLen), barmerge.gaps_off, barmerge.lookahead_off)
+plusDISig = request.security(syminfo.tickerid, signalTF, f_plus_di(adxLen), barmerge.gaps_off, barmerge.lookahead_off)
+minusDISig = request.security(syminfo.tickerid, signalTF, f_minus_di(adxLen), barmerge.gaps_off, barmerge.lookahead_off)
+
+resSig = request.security(syminfo.tickerid, signalTF, ta.highest(high, srLookback), barmerge.gaps_off, barmerge.lookahead_off)
+supSig = request.security(syminfo.tickerid, signalTF, ta.lowest(low, srLookback), barmerge.gaps_off, barmerge.lookahead_off)
+
+ema1mFast = request.security(syminfo.tickerid, "1", ta.ema(close, trend1mFast), barmerge.gaps_off, barmerge.lookahead_off)
+ema1mSlow = request.security(syminfo.tickerid, "1", ta.ema(close, trend1mSlow), barmerge.gaps_off, barmerge.lookahead_off)
+close1m = request.security(syminfo.tickerid, "1", close, barmerge.gaps_off, barmerge.lookahead_off)
+
+trend1mLong = ema1mFast > ema1mSlow and close1m > ema1mFast
+trend1mShort = ema1mFast < ema1mSlow and close1m < ema1mFast
+
+// RSI logic
+longRsiMain = rsiSig >= rsiLongMin and rsiSig <= rsiLongMax
+shortRsiMain = rsiSig <= rsiShortMax and rsiSig >= rsiShortMin
+longRsiTurnFromOS = rsiSig[1] < rsiTurnOS and rsiSig > rsiSig[1]
+shortRsiTurnFromOB = rsiSig[1] > rsiTurnOB and rsiSig < rsiSig[1]
+longRsiOk = longRsiMain or longRsiTurnFromOS
+shortRsiOk = shortRsiMain or shortRsiTurnFromOB
+
+// MACD must trend and expand in trade direction
+longMacdOk = macdLineSig > macdSigSig and macdHistSig > 0 and macdHistSig > macdHistSig[1]
+shortMacdOk = macdLineSig < macdSigSig and macdHistSig < 0 and macdHistSig < macdHistSig[1]
+
+// Strength must be good and directional
+longStrengthOk = adxSig >= adxMin and plusDISig > minusDISig
+shortStrengthOk = adxSig >= adxMin and minusDISig > plusDISig
+
+// Do not move into resistance/support
+roomLong = resSig - sigClose
+roomShort = sigClose - supSig
+longSROk = na(resSig) or roomLong >= (minRoomATR * atrSig)
+shortSROk = na(supSig) or roomShort >= (minRoomATR * atrSig)
+
+// Previous-candle wick exhaustion filter on signal TF.
+// Large upper wick can indicate buyers failing -> avoid new longs.
+// Large lower wick can indicate sellers failing -> avoid new shorts.
+prevRange = sigHigh[1] - sigLow[1]
+prevBody = math.abs(sigClose[1] - sigOpen[1])
+prevUpperWick = sigHigh[1] - math.max(sigOpen[1], sigClose[1])
+prevLowerWick = math.min(sigOpen[1], sigClose[1]) - sigLow[1]
+upperWickFrac = prevRange > 0 ? (prevUpperWick / prevRange) : 0.0
+lowerWickFrac = prevRange > 0 ? (prevLowerWick / prevRange) : 0.0
+upperWickBodyMult = prevBody > 0 ? (prevUpperWick / prevBody) : 0.0
+lowerWickBodyMult = prevBody > 0 ? (prevLowerWick / prevBody) : 0.0
+longWickOk = not useWickFilter or (upperWickFrac <= wickMaxFrac and upperWickBodyMult <= wickMaxBodyMult)
+shortWickOk = not useWickFilter or (lowerWickFrac <= wickMaxFrac and lowerWickBodyMult <= wickMaxBodyMult)
+
+// Overall setup evidence (must-haves + 1m alignment)
+longOverall = longRsiOk and longMacdOk and longStrengthOk and longSROk and trend1mLong and longWickOk
+shortOverall = shortRsiOk and shortMacdOk and shortStrengthOk and shortSROk and trend1mShort and shortWickOk
+
+// -----------------------------------------------------------------------------
+// Limits state
+// -----------------------------------------------------------------------------
+canTrade = true
+
+// -----------------------------------------------------------------------------
+// Pending setup -> next-candle confirmation model
+// -----------------------------------------------------------------------------
+var bool longPending = false
+var bool shortPending = false
+var bool longPendingScalp = false
+var bool shortPendingScalp = false
+
+// -----------------------------------------------------------------------------
+// Risk model and trailing state
+// -----------------------------------------------------------------------------
+var bool longPosIsScalp = false
+var bool shortPosIsScalp = false
+
+usdPer1Move = math.max(usdPer1Move_001lot * (pcRiskLots / 0.01), 0.0001)
+longScalpCapActive = strategy.position_size > 0 ? longPosIsScalp : longPendingScalp
+shortScalpCapActive = strategy.position_size < 0 ? shortPosIsScalp : shortPendingScalp
+maxRiskUsdLong = longScalpCapActive ? maxRiskUsdScalp : maxRiskUsd
+maxRiskUsdShort = shortScalpCapActive ? maxRiskUsdScalp : maxRiskUsd
+maxStopByRiskLong = maxRiskUsdLong / usdPer1Move
+maxStopByRiskShort = maxRiskUsdShort / usdPer1Move
+
+stopDistATR = atrSig * maxSL_ATR
+stopDistMin = atrSig * minSL_ATR
+stopDistLong = math.max(math.min(stopDistATR, maxStopByRiskLong), stopDistMin)
+stopDistShort = math.max(math.min(stopDistATR, maxStopByRiskShort), stopDistMin)
+volatilityOkLong = maxStopDist <= 0.0 or stopDistLong <= maxStopDist
+volatilityOkShort = maxStopDist <= 0.0 or stopDistShort <= maxStopDist
+
+longSL = sigClose - stopDistLong
+longTP = sigClose + (tpR * stopDistLong)
+shortSL = sigClose + stopDistShort
+shortTP = sigClose - (tpR * stopDistShort)
+
+var float longEntryPx = na
+var float shortEntryPx = na
+var float longRiskDist = na
+var float shortRiskDist = na
+var float longHighSinceEntry = na
+var float shortLowSinceEntry = na
+var float dynLongStop = na
+var float dynShortStop = na
+var float posSizePrevTick = 0.0
+
+newLongPos = strategy.position_size > 0 and posSizePrevTick <= 0
+newShortPos = strategy.position_size < 0 and posSizePrevTick >= 0
+justFlat = strategy.position_size == 0 and posSizePrevTick != 0
+
+if newLongPos
+    longEntryPx := strategy.position_avg_price
+    longRiskDist := stopDistLong
+    longHighSinceEntry := high
+    dynLongStop := longEntryPx - longRiskDist
+if newShortPos
+    shortEntryPx := strategy.position_avg_price
+    shortRiskDist := stopDistShort
+    shortLowSinceEntry := low
+    dynShortStop := shortEntryPx + shortRiskDist
+
+if strategy.position_size > 0
+    if na(longEntryPx) or na(longRiskDist)
+        longEntryPx := strategy.position_avg_price
+        longRiskDist := stopDistLong
+        longHighSinceEntry := high
+        dynLongStop := longEntryPx - longRiskDist
+    longHighSinceEntry := na(longHighSinceEntry) ? high : math.max(longHighSinceEntry, high)
+    rNowLong = longRiskDist > 0 ? ((longHighSinceEntry - longEntryPx) / longRiskDist) : 0.0
+    stopCandidateLong = longEntryPx - longRiskDist
+    if rNowLong >= 1.0
+        stopCandidateLong := math.max(stopCandidateLong, longEntryPx)
+        longStepIdx = math.floor((rNowLong - 1.0) / 0.5)
+        if longStepIdx >= 1
+            lockR = 0.75 + (0.5 * longStepIdx)
+            stopCandidateLong := math.max(stopCandidateLong, longEntryPx + (lockR * longRiskDist))
+    dynLongStop := na(dynLongStop) ? stopCandidateLong : math.max(dynLongStop, stopCandidateLong)
+
+if strategy.position_size < 0
+    if na(shortEntryPx) or na(shortRiskDist)
+        shortEntryPx := strategy.position_avg_price
+        shortRiskDist := stopDistShort
+        shortLowSinceEntry := low
+        dynShortStop := shortEntryPx + shortRiskDist
+    shortLowSinceEntry := na(shortLowSinceEntry) ? low : math.min(shortLowSinceEntry, low)
+    rNowShort = shortRiskDist > 0 ? ((shortEntryPx - shortLowSinceEntry) / shortRiskDist) : 0.0
+    stopCandidateShort = shortEntryPx + shortRiskDist
+    if rNowShort >= 1.0
+        stopCandidateShort := math.min(stopCandidateShort, shortEntryPx)
+        shortStepIdx = math.floor((rNowShort - 1.0) / 0.5)
+        if shortStepIdx >= 1
+            lockR = 0.75 + (0.5 * shortStepIdx)
+            stopCandidateShort := math.min(stopCandidateShort, shortEntryPx - (lockR * shortRiskDist))
+    dynShortStop := na(dynShortStop) ? stopCandidateShort : math.min(dynShortStop, stopCandidateShort)
+
+if justFlat
+    longEntryPx := na
+    shortEntryPx := na
+    longRiskDist := na
+    shortRiskDist := na
+    longHighSinceEntry := na
+    shortLowSinceEntry := na
+    dynLongStop := na
+    dynShortStop := na
+    longPosIsScalp := false
+    shortPosIsScalp := false
+
+// -----------------------------------------------------------------------------
+// Alert and order state
+// -----------------------------------------------------------------------------
+var int lastEntryAlertBar = na
+entryBarOk = true
+
+var label lastSetupLbl = na
+var float lastSentLongSL = na
+var float lastSentShortSL = na
+var int lastLongModMs = na
+var int lastShortModMs = na
+var bool longEntryAlertSentForPos = false
+var bool shortEntryAlertSentForPos = false
+var int lastLongEntryAlertBar = na
+var int lastShortEntryAlertBar = na
+var int modWindowStartMs = na
+var int modWindowCount = 0
+var string lastWebhookPayload = ""
+var int lastWebhookMs = na
+
+var table entryAlertTbl = table.new(position.top_center, 1, 1, frame_color=color.new(color.black, 70), frame_width=1)
+if barstate.isfirst
+    table.cell(entryAlertTbl, 0, 0, "", text_color=color.white, text_size=size.tiny, bgcolor=color.new(color.black, 100))
+
+nowMs = timenow
+
+// -----------------------------------------------------------------------------
+// Entry engine: setup at 5m close, execute on next 5m close if candle confirms
+// -----------------------------------------------------------------------------
+if barOk
+    longTrigger = longPending and sigClose > sigOpen
+    shortTrigger = shortPending and sigClose < sigOpen
+
+    longPending := false
+    shortPending := false
+
+    fireLong = longTrigger and useLong and canTrade and volatilityOkLong and strategy.position_size <= 0 and not shortTrigger
+    fireShort = shortTrigger and useShort and canTrade and volatilityOkShort and strategy.position_size >= 0 and not longTrigger
+
+    if fireLong
+        longId = longPendingScalp ? "L-RSI-TURN" : "L-CORE"
+        strategy.entry(longId, strategy.long)
+        longPosIsScalp := longPendingScalp
+
+        tag = longPendingScalp ? "LONG:RSI-TURN" : "LONG:CORE"
+        label.delete(lastSetupLbl)
+        lastSetupLbl := label.new(bar_index, low, tag, style=label.style_label_up, textcolor=color.white, color=color.new(color.green, 0))
+
+        longPayload = f_pc_buy(longSL, longTP, tag)
+        longDupBlocked = pcDuplicateSuppressMs > 0 and not na(nowMs) and not na(lastWebhookMs) and longPayload == lastWebhookPayload and (nowMs - lastWebhookMs) <= pcDuplicateSuppressMs
+        if sendPCAlerts and entryBarOk and not longDupBlocked
+            alert(longPayload, alert.freq_once_per_bar_close)
+            lastEntryAlertBar := bar_index
+            lastLongEntryAlertBar := bar_index
+            longEntryAlertSentForPos := true
+            lastWebhookPayload := longPayload
+            lastWebhookMs := nowMs
+            table.cell(entryAlertTbl, 0, 0, str.format("ENTRY ALERT SENT: CLS+OL | {0}", tag), text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.green, 75))
+        else
+            skipReason = not sendPCAlerts ? "sendPCAlerts=OFF" : not entryBarOk ? "entry gate" : "duplicate suppress"
+            table.cell(entryAlertTbl, 0, 0, str.format("ENTRY ALERT SKIPPED: CLS+OL | {0} | {1}", tag, skipReason), text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.orange, 70))
+
+    if fireShort
+        shortId = shortPendingScalp ? "S-RSI-TURN" : "S-CORE"
+        strategy.entry(shortId, strategy.short)
+        shortPosIsScalp := shortPendingScalp
+
+        tag = shortPendingScalp ? "SHORT:RSI-TURN" : "SHORT:CORE"
+        label.delete(lastSetupLbl)
+        lastSetupLbl := label.new(bar_index, high, tag, style=label.style_label_down, textcolor=color.black, color=color.new(color.red, 0))
+
+        shortPayload = f_pc_sell(shortSL, shortTP, tag)
+        shortDupBlocked = pcDuplicateSuppressMs > 0 and not na(nowMs) and not na(lastWebhookMs) and shortPayload == lastWebhookPayload and (nowMs - lastWebhookMs) <= pcDuplicateSuppressMs
+        if sendPCAlerts and entryBarOk and not shortDupBlocked
+            alert(shortPayload, alert.freq_once_per_bar_close)
+            lastEntryAlertBar := bar_index
+            lastShortEntryAlertBar := bar_index
+            shortEntryAlertSentForPos := true
+            lastWebhookPayload := shortPayload
+            lastWebhookMs := nowMs
+            table.cell(entryAlertTbl, 0, 0, str.format("ENTRY ALERT SENT: CLS+OS | {0}", tag), text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.red, 75))
+        else
+            skipReason = not sendPCAlerts ? "sendPCAlerts=OFF" : not entryBarOk ? "entry gate" : "duplicate suppress"
+            table.cell(entryAlertTbl, 0, 0, str.format("ENTRY ALERT SKIPPED: CLS+OS | {0} | {1}", tag, skipReason), text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.orange, 70))
+
+    // Build new pending signal for next 5m candle
+    if longOverall and not shortOverall
+        longPending := true
+        longPendingScalp := longRsiTurnFromOS
+        shortPendingScalp := false
+    else if shortOverall and not longOverall
+        shortPending := true
+        shortPendingScalp := shortRsiTurnFromOB
+        longPendingScalp := false
+    else
+        longPendingScalp := false
+        shortPendingScalp := false
+
+if newLongPos
+    lastSentLongSL := na
+    lastLongModMs := na
+if newShortPos
+    lastSentShortSL := na
+    lastShortModMs := na
+if justFlat
+    lastSentLongSL := na
+    lastSentShortSL := na
+    lastLongModMs := na
+    lastShortModMs := na
+    longEntryAlertSentForPos := false
+    shortEntryAlertSentForPos := false
+    lastLongEntryAlertBar := na
+    lastShortEntryAlertBar := na
+
+// -----------------------------------------------------------------------------
+// SL modify alerts
+// -----------------------------------------------------------------------------
+if na(modWindowStartMs) or (not na(nowMs) and nowMs - modWindowStartMs >= 60000)
+    modWindowStartMs := nowMs
+    modWindowCount := 0
+
+modRateOk = pcMaxSLModsPerMinute <= 0 or modWindowCount < pcMaxSLModsPerMinute
+longEntryReadyForMods = not pcRequireEntryAlertBeforeSLMods or longEntryAlertSentForPos
+shortEntryReadyForMods = not pcRequireEntryAlertBeforeSLMods or shortEntryAlertSentForPos
+longAfterEntryBarOk = na(lastLongEntryAlertBar) or bar_index > lastLongEntryAlertBar
+shortAfterEntryBarOk = na(lastShortEntryAlertBar) or bar_index > lastShortEntryAlertBar
+longRNow = not na(longEntryPx) and not na(longRiskDist) and longRiskDist > 0 ? (longHighSinceEntry - longEntryPx) / longRiskDist : 0.0
+shortRNow = not na(shortEntryPx) and not na(shortRiskDist) and shortRiskDist > 0 ? (shortEntryPx - shortLowSinceEntry) / shortRiskDist : 0.0
+longReachedModR = longRNow >= pcModStartR
+shortReachedModR = shortRNow >= pcModStartR
+longModCooldownOk = pcMinSecondsBetweenSLMods <= 0 or na(lastLongModMs) or (not na(nowMs) and (nowMs - lastLongModMs) >= pcMinSecondsBetweenSLMods * 1000)
+shortModCooldownOk = pcMinSecondsBetweenSLMods <= 0 or na(lastShortModMs) or (not na(nowMs) and (nowMs - lastShortModMs) >= pcMinSecondsBetweenSLMods * 1000)
+modLongDistanceOk = pcMinModifyGap <= 0.0 or dynLongStop <= (close - pcMinModifyGap)
+modShortDistanceOk = pcMinModifyGap <= 0.0 or dynShortStop >= (close + pcMinModifyGap)
+
+modGateCloseTime = request.security(syminfo.tickerid, "1", time_close, barmerge.gaps_off, barmerge.lookahead_off)
+isNewModGateClose = not na(modGateCloseTime[1]) and modGateCloseTime != modGateCloseTime[1]
+modTimingOk = pcIntrabarSLUpdates ? barstate.isrealtime : isNewModGateClose
+
+longSLAdvanced = useTrailingSL and strategy.position_size > 0 and not na(dynLongStop) and modTimingOk and longReachedModR and longEntryReadyForMods and longAfterEntryBarOk and modRateOk and modLongDistanceOk and longModCooldownOk and (na(lastSentLongSL) or dynLongStop > lastSentLongSL + syminfo.mintick)
+shortSLAdvanced = useTrailingSL and strategy.position_size < 0 and not na(dynShortStop) and modTimingOk and shortReachedModR and shortEntryReadyForMods and shortAfterEntryBarOk and modRateOk and modShortDistanceOk and shortModCooldownOk and (na(lastSentShortSL) or dynShortStop < lastSentShortSL - syminfo.mintick)
+
+if sendPCAlerts and barstate.isrealtime and longSLAdvanced
+    longModPayload = f_pc_mod_long_sl(dynLongStop)
+    longModDupBlocked = pcDuplicateSuppressMs > 0 and not na(nowMs) and not na(lastWebhookMs) and longModPayload == lastWebhookPayload and (nowMs - lastWebhookMs) <= pcDuplicateSuppressMs
+    if not longModDupBlocked
+        alert(longModPayload, pcIntrabarSLUpdates ? alert.freq_all : alert.freq_once_per_bar_close)
+        lastSentLongSL := dynLongStop
+        lastLongModMs := nowMs
+        lastWebhookPayload := longModPayload
+        lastWebhookMs := nowMs
+        modWindowCount += 1
+
+if sendPCAlerts and barstate.isrealtime and shortSLAdvanced
+    shortModPayload = f_pc_mod_short_sl(dynShortStop)
+    shortModDupBlocked = pcDuplicateSuppressMs > 0 and not na(nowMs) and not na(lastWebhookMs) and shortModPayload == lastWebhookPayload and (nowMs - lastWebhookMs) <= pcDuplicateSuppressMs
+    if not shortModDupBlocked
+        alert(shortModPayload, pcIntrabarSLUpdates ? alert.freq_all : alert.freq_once_per_bar_close)
+        lastSentShortSL := dynShortStop
+        lastShortModMs := nowMs
+        lastWebhookPayload := shortModPayload
+        lastWebhookMs := nowMs
+        modWindowCount += 1
+
+posSizePrevTick := strategy.position_size
+
+// -----------------------------------------------------------------------------
+// Strategy exits
+// -----------------------------------------------------------------------------
+if strategy.position_size > 0
+    strategy.exit("L-CORE-exit", "L-CORE", stop=useTrailingSL ? dynLongStop : longSL, limit=useTrailingSL ? na : longTP)
+    strategy.exit("L-RSI-TURN-exit", "L-RSI-TURN", stop=useTrailingSL ? dynLongStop : longSL, limit=useTrailingSL ? na : longTP)
+
+if strategy.position_size < 0
+    strategy.exit("S-CORE-exit", "S-CORE", stop=useTrailingSL ? dynShortStop : shortSL, limit=useTrailingSL ? na : shortTP)
+    strategy.exit("S-RSI-TURN-exit", "S-RSI-TURN", stop=useTrailingSL ? dynShortStop : shortSL, limit=useTrailingSL ? na : shortTP)
+
+// -----------------------------------------------------------------------------
+// Visuals
+// -----------------------------------------------------------------------------
+plot(resSig, "Resistance", color=color.new(color.red, 0), style=plot.style_linebr)
+plot(supSig, "Support", color=color.new(color.teal, 0), style=plot.style_linebr)
+
+var table gateTbl = table.new(position.bottom_center, 7, 3, frame_color=color.new(color.black, 70), frame_width=1)
+if barstate.isfirst
+    table.cell(gateTbl, 0, 0, "Side", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 70))
+    table.cell(gateTbl, 1, 0, "Overall", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 70))
+    table.cell(gateTbl, 2, 0, "RSI", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 70))
+    table.cell(gateTbl, 3, 0, "MACD", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 70))
+    table.cell(gateTbl, 4, 0, "Strength", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 70))
+    table.cell(gateTbl, 5, 0, "S/R", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 70))
+    table.cell(gateTbl, 6, 0, "Wicking", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 70))
+
+longOverallDbg = longOverall
+shortOverallDbg = shortOverall
+
+table.cell(gateTbl, 0, 1, "Long", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 85))
+table.cell(gateTbl, 1, 1, f_ok(longOverallDbg), text_color=f_col(longOverallDbg), text_size=size.tiny, bgcolor=color.new(color.black, 85))
+table.cell(gateTbl, 2, 1, f_ok(longRsiOk), text_color=f_col(longRsiOk), text_size=size.tiny, bgcolor=color.new(color.black, 85))
+table.cell(gateTbl, 3, 1, f_ok(longMacdOk), text_color=f_col(longMacdOk), text_size=size.tiny, bgcolor=color.new(color.black, 85))
+table.cell(gateTbl, 4, 1, f_ok(longStrengthOk), text_color=f_col(longStrengthOk), text_size=size.tiny, bgcolor=color.new(color.black, 85))
+table.cell(gateTbl, 5, 1, f_ok(longSROk), text_color=f_col(longSROk), text_size=size.tiny, bgcolor=color.new(color.black, 85))
+table.cell(gateTbl, 6, 1, f_ok(longWickOk), text_color=f_col(longWickOk), text_size=size.tiny, bgcolor=color.new(color.black, 85))
+
+table.cell(gateTbl, 0, 2, "Short", text_color=color.black, text_size=size.tiny, bgcolor=color.new(color.black, 85))
+table.cell(gateTbl, 1, 2, f_ok(shortOverallDbg), text_color=f_col(shortOverallDbg), text_size=size.tiny, bgcolor=color.new(color.black, 85))
+table.cell(gateTbl, 2, 2, f_ok(shortRsiOk), text_color=f_col(shortRsiOk), text_size=size.tiny, bgcolor=color.new(color.black, 85))
+table.cell(gateTbl, 3, 2, f_ok(shortMacdOk), text_color=f_col(shortMacdOk), text_size=size.tiny, bgcolor=color.new(color.black, 85))
+table.cell(gateTbl, 4, 2, f_ok(shortStrengthOk), text_color=f_col(shortStrengthOk), text_size=size.tiny, bgcolor=color.new(color.black, 85))
+table.cell(gateTbl, 5, 2, f_ok(shortSROk), text_color=f_col(shortSROk), text_size=size.tiny, bgcolor=color.new(color.black, 85))
+table.cell(gateTbl, 6, 2, f_ok(shortWickOk), text_color=f_col(shortWickOk), text_size=size.tiny, bgcolor=color.new(color.black, 85))
