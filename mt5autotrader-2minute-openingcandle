@@ -1,0 +1,270 @@
+//@version=5
+indicator("MT5 AutoTrader - 2 Minute Opening Candle", overlay=true, max_labels_count=500)
+
+// -----------------------------------------------------------------------------
+// Purpose
+// -----------------------------------------------------------------------------
+// This script scans a small watchlist around key pre-session checkpoints and
+// highlights symbols where:
+// - the fast SMMA is close to the 200 SMMA
+// - the 200 SMMA is relatively flat / horizontal
+// - the fast SMMA is crossing or likely about to cross the 200
+//
+// Current checkpoints (SAST):
+// - Tokyo pre-open:   01:45
+// - London pre-open:  08:45
+// - New York pre-open:15:15
+//
+// Current goal:
+// - produce a shortlist to watch at session open
+// - not auto-trade yet
+
+// -----------------------------------------------------------------------------
+// Inputs
+// -----------------------------------------------------------------------------
+groupMA = "Moving Averages"
+fastLen = input.int(21, "Fast SMMA Length", minval=1, group=groupMA)
+slowLen = input.int(200, "Slow SMMA Length", minval=1, group=groupMA)
+
+groupCloseness = "Closeness Logic"
+useAtrThreshold = input.bool(true, "Use ATR-based closeness threshold", group=groupCloseness)
+atrLen = input.int(14, "ATR Length", minval=1, group=groupCloseness)
+atrMultiple = input.float(0.10, "Closeness threshold as ATR multiple", step=0.01, minval=0.0, group=groupCloseness)
+fixedThreshold = input.float(5.0, "Fixed closeness threshold (price units)", step=0.1, minval=0.0, group=groupCloseness)
+
+flatLookbackBars = input.int(5, "Flat-200 lookback bars", minval=1, group=groupCloseness)
+flatAtrMultiple = input.float(0.08, "Flat-200 threshold as ATR multiple", step=0.01, minval=0.0, group=groupCloseness)
+likelyCrossAtrMultiple = input.float(0.18, "Likely-cross threshold as ATR multiple", step=0.01, minval=0.0, group=groupCloseness)
+
+groupSession = "Session Windows"
+useLondon = input.bool(true, "Track London pre-open", group=groupSession)
+useNewYork = input.bool(true, "Track New York pre-open", group=groupSession)
+useAsia = input.bool(true, "Track Tokyo pre-open", group=groupSession)
+sessionTz = input.string("Africa/Johannesburg", "Reference timezone", options=["Africa/Johannesburg", "UTC", "Europe/London", "America/New_York"], group=groupSession)
+asiaHour = input.int(1, "Tokyo pre-open hour", minval=0, maxval=23, group=groupSession)
+asiaMinute = input.int(45, "Tokyo pre-open minute", minval=0, maxval=59, group=groupSession)
+londonHour = input.int(8, "London pre-open hour", minval=0, maxval=23, group=groupSession)
+londonMinute = input.int(45, "London pre-open minute", minval=0, maxval=59, group=groupSession)
+newYorkHour = input.int(15, "New York pre-open hour", minval=0, maxval=23, group=groupSession)
+newYorkMinute = input.int(15, "New York pre-open minute", minval=0, maxval=59, group=groupSession)
+
+groupWatch = "Starter Watchlist"
+useXAU = input.bool(true, "XAUUSD", group=groupWatch)
+useBTC = input.bool(true, "BTCUSD", group=groupWatch)
+useNAS = input.bool(true, "NAS100", group=groupWatch)
+useUS30 = input.bool(true, "US30", group=groupWatch)
+useEURUSD = input.bool(true, "EURUSD", group=groupWatch)
+useGBPUSD = input.bool(true, "GBPUSD", group=groupWatch)
+useUSDJPY = input.bool(true, "USDJPY", group=groupWatch)
+useAUDUSD = input.bool(true, "AUDUSD", group=groupWatch)
+useNZDUSD = input.bool(true, "NZDUSD", group=groupWatch)
+
+groupDisplay = "Display"
+showBackground = input.bool(true, "Highlight active checkpoint window", group=groupDisplay)
+showTable = input.bool(true, "Show shortlist table", group=groupDisplay)
+tablePosition = input.string("Top Right", "Table position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=groupDisplay)
+showChartSMMA = input.bool(true, "Plot chart symbol SMMAs", group=groupDisplay)
+showOnlyCandidates = input.bool(true, "Only show qualifying symbols in table", group=groupDisplay)
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+f_smma(_src, _len) =>
+    ta.rma(_src, _len)
+
+f_position(_pos) =>
+    _pos == "Top Left" ? position.top_left : _pos == "Bottom Left" ? position.bottom_left : _pos == "Bottom Right" ? position.bottom_right : position.top_right
+
+f_is_session_marker(_hour, _minute) =>
+    currentYear = year(time, sessionTz)
+    currentMonth = month(time, sessionTz)
+    currentDay = dayofmonth(time, sessionTz)
+    targetTs = timestamp(sessionTz, currentYear, currentMonth, currentDay, _hour, _minute)
+    time >= targetTs and time < (targetTs + 2 * 60 * 1000)
+
+inAsiaWindow = useAsia and f_is_session_marker(asiaHour, asiaMinute)
+inLondonWindow = useLondon and f_is_session_marker(londonHour, londonMinute)
+inNewYorkWindow = useNewYork and f_is_session_marker(newYorkHour, newYorkMinute)
+inTrackedWindow = inAsiaWindow or inLondonWindow or inNewYorkWindow
+sessionLabel = inAsiaWindow ? "Tokyo Pre-Open" : inLondonWindow ? "London Pre-Open" : inNewYorkWindow ? "New York Pre-Open" : "Idle"
+
+chartFast = f_smma(close, fastLen)
+chartSlow = f_smma(close, slowLen)
+plot(showChartSMMA ? chartFast : na, title="Fast SMMA", color=color.new(color.aqua, 0), linewidth=2)
+plot(showChartSMMA ? chartSlow : na, title="Slow SMMA", color=color.new(color.orange, 0), linewidth=2)
+bgcolor(showBackground and inTrackedWindow ? color.new(color.blue, 90) : na, title="Session marker window")
+
+// -----------------------------------------------------------------------------
+// Scanner logic for one symbol
+// -----------------------------------------------------------------------------
+f_scan_symbol(_symbol, _enabled) =>
+    fast = request.security(_symbol, timeframe.period, f_smma(close, fastLen), barmerge.gaps_off, barmerge.lookahead_off)
+    slow = request.security(_symbol, timeframe.period, f_smma(close, slowLen), barmerge.gaps_off, barmerge.lookahead_off)
+    atr = request.security(_symbol, timeframe.period, ta.atr(atrLen), barmerge.gaps_off, barmerge.lookahead_off)
+    fastPrev = request.security(_symbol, timeframe.period, f_smma(close, fastLen)[1], barmerge.gaps_off, barmerge.lookahead_off)
+    slowPrev = request.security(_symbol, timeframe.period, f_smma(close, slowLen)[1], barmerge.gaps_off, barmerge.lookahead_off)
+    slowLookback = request.security(_symbol, timeframe.period, f_smma(close, slowLen)[flatLookbackBars], barmerge.gaps_off, barmerge.lookahead_off)
+
+    distance = math.abs(fast - slow)
+    closeThreshold = useAtrThreshold ? (atr * atrMultiple) : fixedThreshold
+    isClose = distance <= closeThreshold
+
+    slowSlopeAbs = math.abs(slow - slowLookback)
+    flatThreshold = atr * flatAtrMultiple
+    isFlat = slowSlopeAbs <= flatThreshold
+
+    crossedUp = fastPrev <= slowPrev and fast > slow
+    crossedDown = fastPrev >= slowPrev and fast < slow
+    fastSlope = fast - fastPrev
+    above = fast > slow
+    below = fast < slow
+
+    likelyUp = below and fastSlope > 0 and distance <= (atr * likelyCrossAtrMultiple)
+    likelyDown = above and fastSlope < 0 and distance <= (atr * likelyCrossAtrMultiple)
+
+    qualifies = _enabled and isClose and isFlat and (crossedUp or crossedDown or likelyUp or likelyDown)
+    direction = crossedUp ? "Cross ↑" : crossedDown ? "Cross ↓" : likelyUp ? "Likely ↑" : likelyDown ? "Likely ↓" : above ? "Above" : below ? "Below" : "Flat"
+    score = qualifies ? (distance / math.max(atr, 0.000001)) + (slowSlopeAbs / math.max(atr, 0.000001)) : 999999.0
+
+    [distance, atr, isClose, isFlat, crossedUp, crossedDown, likelyUp, likelyDown, qualifies, direction, fast, slow, score]
+
+// -----------------------------------------------------------------------------
+// Watchlist scan
+// -----------------------------------------------------------------------------
+[xauDist, xauAtr, xauClose, xauFlat, xauCrossUp, xauCrossDown, xauLikelyUp, xauLikelyDown, xauQualifies, xauDirection, xauFast, xauSlow, xauScore] = f_scan_symbol("OANDA:XAUUSD", useXAU)
+[btcDist, btcAtr, btcClose, btcFlat, btcCrossUp, btcCrossDown, btcLikelyUp, btcLikelyDown, btcQualifies, btcDirection, btcFast, btcSlow, btcScore] = f_scan_symbol("FOREXCOM:BTCUSD", useBTC)
+[nasDist, nasAtr, nasClose, nasFlat, nasCrossUp, nasCrossDown, nasLikelyUp, nasLikelyDown, nasQualifies, nasDirection, nasFast, nasSlow, nasScore] = f_scan_symbol("CAPITALCOM:US100", useNAS)
+[us30Dist, us30Atr, us30Close, us30Flat, us30CrossUp, us30CrossDown, us30LikelyUp, us30LikelyDown, us30Qualifies, us30Direction, us30Fast, us30Slow, us30Score] = f_scan_symbol("CAPITALCOM:US30", useUS30)
+[eurDist, eurAtr, eurClose, eurFlat, eurCrossUp, eurCrossDown, eurLikelyUp, eurLikelyDown, eurQualifies, eurDirection, eurFast, eurSlow, eurScore] = f_scan_symbol("OANDA:EURUSD", useEURUSD)
+[gbpDist, gbpAtr, gbpClose, gbpFlat, gbpCrossUp, gbpCrossDown, gbpLikelyUp, gbpLikelyDown, gbpQualifies, gbpDirection, gbpFast, gbpSlow, gbpScore] = f_scan_symbol("OANDA:GBPUSD", useGBPUSD)
+[ujDist, ujAtr, ujClose, ujFlat, ujCrossUp, ujCrossDown, ujLikelyUp, ujLikelyDown, ujQualifies, ujDirection, ujFast, ujSlow, ujScore] = f_scan_symbol("OANDA:USDJPY", useUSDJPY)
+[audDist, audAtr, audClose, audFlat, audCrossUp, audCrossDown, audLikelyUp, audLikelyDown, audQualifies, audDirection, audFast, audSlow, audScore] = f_scan_symbol("OANDA:AUDUSD", useAUDUSD)
+[nzdDist, nzdAtr, nzdClose, nzdFlat, nzdCrossUp, nzdCrossDown, nzdLikelyUp, nzdLikelyDown, nzdQualifies, nzdDirection, nzdFast, nzdSlow, nzdScore] = f_scan_symbol("OANDA:NZDUSD", useNZDUSD)
+
+// -----------------------------------------------------------------------------
+// Top 3 candidate selection
+// -----------------------------------------------------------------------------
+var string top1Symbol = ""
+var string top2Symbol = ""
+var string top3Symbol = ""
+var string top1Direction = ""
+var string top2Direction = ""
+var string top3Direction = ""
+var float top1Score = na
+var float top2Score = na
+var float top3Score = na
+
+f_consider(_symbol, _qualifies, _direction, _score) =>
+    if _qualifies
+        if na(top1Score) or _score < top1Score
+            top3Score := top2Score
+            top3Symbol := top2Symbol
+            top3Direction := top2Direction
+            top2Score := top1Score
+            top2Symbol := top1Symbol
+            top2Direction := top1Direction
+            top1Score := _score
+            top1Symbol := _symbol
+            top1Direction := _direction
+        else if na(top2Score) or _score < top2Score
+            top3Score := top2Score
+            top3Symbol := top2Symbol
+            top3Direction := top2Direction
+            top2Score := _score
+            top2Symbol := _symbol
+            top2Direction := _direction
+        else if na(top3Score) or _score < top3Score
+            top3Score := _score
+            top3Symbol := _symbol
+            top3Direction := _direction
+
+top1Symbol := ""
+top2Symbol := ""
+top3Symbol := ""
+top1Direction := ""
+top2Direction := ""
+top3Direction := ""
+top1Score := na
+top2Score := na
+top3Score := na
+
+f_consider("XAUUSD", xauQualifies, xauDirection, xauScore)
+f_consider("BTCUSD", btcQualifies, btcDirection, btcScore)
+f_consider("NAS100", nasQualifies, nasDirection, nasScore)
+f_consider("US30", us30Qualifies, us30Direction, us30Score)
+f_consider("EURUSD", eurQualifies, eurDirection, eurScore)
+f_consider("GBPUSD", gbpQualifies, gbpDirection, gbpScore)
+f_consider("USDJPY", ujQualifies, ujDirection, ujScore)
+f_consider("AUDUSD", audQualifies, audDirection, audScore)
+f_consider("NZDUSD", nzdQualifies, nzdDirection, nzdScore)
+
+// -----------------------------------------------------------------------------
+// Table rendering
+// -----------------------------------------------------------------------------
+var table scannerTable = table.new(f_position(tablePosition), 6, 16, border_width=1)
+
+f_row(_row, _symbol, _enabled, _distance, _atr, _isFlat, _qualifies, _direction) =>
+    showRow = _enabled and (not showOnlyCandidates or _qualifies)
+    symbolText = showRow ? _symbol : ""
+    distText = showRow ? str.tostring(_distance, format.mintick) : ""
+    atrText = showRow ? str.tostring(_atr, format.mintick) : ""
+    flatText = showRow ? (_isFlat ? "YES" : "NO") : ""
+    qualText = showRow ? (_qualifies ? "YES" : "NO") : ""
+    dirText = showRow ? _direction : ""
+    rowBg = _qualifies ? color.new(color.green, 80) : color.new(color.gray, 92)
+    rowTxt = _qualifies ? color.white : color.silver
+    table.cell(scannerTable, 0, _row, symbolText, bgcolor=rowBg, text_color=rowTxt)
+    table.cell(scannerTable, 1, _row, distText, bgcolor=rowBg, text_color=rowTxt)
+    table.cell(scannerTable, 2, _row, atrText, bgcolor=rowBg, text_color=rowTxt)
+    table.cell(scannerTable, 3, _row, flatText, bgcolor=rowBg, text_color=rowTxt)
+    table.cell(scannerTable, 4, _row, dirText, bgcolor=rowBg, text_color=rowTxt)
+    table.cell(scannerTable, 5, _row, qualText, bgcolor=rowBg, text_color=rowTxt)
+
+if barstate.islast and showTable
+    table.clear(scannerTable, 0, 0, 5, 15)
+    headerBg = color.new(color.blue, 70)
+    table.cell(scannerTable, 0, 0, "Session", bgcolor=headerBg, text_color=color.white)
+    table.cell(scannerTable, 1, 0, sessionLabel, bgcolor=headerBg, text_color=color.white)
+    table.cell(scannerTable, 2, 0, inTrackedWindow ? "ACTIVE" : "IDLE", bgcolor=headerBg, text_color=color.white)
+    table.cell(scannerTable, 3, 0, "Fast/Slow", bgcolor=headerBg, text_color=color.white)
+    table.cell(scannerTable, 4, 0, str.tostring(fastLen) + "/" + str.tostring(slowLen), bgcolor=headerBg, text_color=color.white)
+    table.cell(scannerTable, 5, 0, "", bgcolor=headerBg)
+
+    topBg = color.new(color.purple, 70)
+    table.cell(scannerTable, 0, 1, "Top 1", bgcolor=topBg, text_color=color.white)
+    table.cell(scannerTable, 1, 1, top1Symbol, bgcolor=topBg, text_color=color.white)
+    table.cell(scannerTable, 2, 1, top1Direction, bgcolor=topBg, text_color=color.white)
+    table.cell(scannerTable, 3, 1, "Top 2", bgcolor=topBg, text_color=color.white)
+    table.cell(scannerTable, 4, 1, top2Symbol, bgcolor=topBg, text_color=color.white)
+    table.cell(scannerTable, 5, 1, top2Direction, bgcolor=topBg, text_color=color.white)
+
+    table.cell(scannerTable, 0, 2, "Top 3", bgcolor=topBg, text_color=color.white)
+    table.cell(scannerTable, 1, 2, top3Symbol, bgcolor=topBg, text_color=color.white)
+    table.cell(scannerTable, 2, 2, top3Direction, bgcolor=topBg, text_color=color.white)
+    table.cell(scannerTable, 3, 2, "", bgcolor=topBg)
+    table.cell(scannerTable, 4, 2, "", bgcolor=topBg)
+    table.cell(scannerTable, 5, 2, "", bgcolor=topBg)
+
+    subBg = color.new(color.gray, 80)
+    table.cell(scannerTable, 0, 3, "Symbol", bgcolor=subBg, text_color=color.white)
+    table.cell(scannerTable, 1, 3, "Distance", bgcolor=subBg, text_color=color.white)
+    table.cell(scannerTable, 2, 3, "ATR", bgcolor=subBg, text_color=color.white)
+    table.cell(scannerTable, 3, 3, "200 Flat", bgcolor=subBg, text_color=color.white)
+    table.cell(scannerTable, 4, 3, "Direction", bgcolor=subBg, text_color=color.white)
+    table.cell(scannerTable, 5, 3, "Candidate", bgcolor=subBg, text_color=color.white)
+
+    f_row(4, "XAUUSD", useXAU, xauDist, xauAtr, xauFlat, xauQualifies, xauDirection)
+    f_row(5, "BTCUSD", useBTC, btcDist, btcAtr, btcFlat, btcQualifies, btcDirection)
+    f_row(6, "NAS100", useNAS, nasDist, nasAtr, nasFlat, nasQualifies, nasDirection)
+    f_row(7, "US30", useUS30, us30Dist, us30Atr, us30Flat, us30Qualifies, us30Direction)
+    f_row(8, "EURUSD", useEURUSD, eurDist, eurAtr, eurFlat, eurQualifies, eurDirection)
+    f_row(9, "GBPUSD", useGBPUSD, gbpDist, gbpAtr, gbpFlat, gbpQualifies, gbpDirection)
+    f_row(10, "USDJPY", useUSDJPY, ujDist, ujAtr, ujFlat, ujQualifies, ujDirection)
+    f_row(11, "AUDUSD", useAUDUSD, audDist, audAtr, audFlat, audQualifies, audDirection)
+    f_row(12, "NZDUSD", useNZDUSD, nzdDist, nzdAtr, nzdFlat, nzdQualifies, nzdDirection)
+
+// -----------------------------------------------------------------------------
+// Alerts
+// -----------------------------------------------------------------------------
+anyCandidate = xauQualifies or btcQualifies or nasQualifies or us30Qualifies or eurQualifies or gbpQualifies or ujQualifies or audQualifies or nzdQualifies
+alertcondition(inTrackedWindow and anyCandidate, title="Session pre-open scanner found candidates", message="One or more watchlist symbols have a fast SMMA close to a flat 200 SMMA before session open.")
